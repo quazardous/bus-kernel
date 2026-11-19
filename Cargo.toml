@@ -1,6 +1,6 @@
 [package]
 name = "bus-kernel"
-version = "0.2.0"
+version = "0.2.1"
 description = "A hook bus kernel implementing bus-contract: typed hook points, listeners with ids ordered by after/before and priority, alter and collect emits, a per-listener error boundary with panics caught and deadlines, local listeners, deferred requests, timings, a host journal and relay; and a conformance suite any bus-contract implementation can run"
 readme = "README.md"
 keywords = ["hooks", "event-bus", "plugins", "listeners", "bus-contract"]

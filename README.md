@@ -204,6 +204,16 @@ ones; `conformance::checks()` lists them for a harness of its own. A
 capability the bus does not offer skips its checks. This kernel runs the
 suite on itself.
 
+The checks are grouped by contract, as bus-contract's
+[guarantees page](https://github.com/quazardous/bus-contract/blob/main/GUARANTEES.md)
+splits it: `core`, `defer`, `timings`, `journal` and `crossing`.
+`run_contract(Contract::Journal, make)` runs one group. Each check names
+the property ids it proves (`Check::proves`, such as
+`core.order.declared`), and a failure names them too; `summary(make)`
+writes every outcome with its ids, then the properties no check proves.
+The crate carries a copy of the guarantees page, and its tests refuse a
+check naming an id the page does not have.
+
 ## Versions
 
 `bus-kernel` follows `bus-contract`'s minor versions: 0.1 implements

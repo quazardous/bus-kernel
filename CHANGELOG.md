@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.1
+
+Conformance grouped by contract; additive.
+
+- `conformance::Contract` (`core`, `defer`, `timings`, `journal`,
+  `crossing`) and `Check::contract`; `checks_of`, `report_contract` and
+  `run_contract` run one contract's group, `run` still runs them all.
+- Each check names the property ids of bus-contract's guarantees page it
+  proves (`Check::proves`); a failure lists them. The page ships with
+  the crate (`conformance::GUARANTEES`, a copy of bus-contract 0.4.3's
+  `GUARANTEES.md`), `properties()` reads its ids, `unproved()` lists
+  those no check proves, and `summary(make)` writes every outcome with
+  its ids. A test refuses an id the page does not have, and a check name
+  in the page that does not exist.
+- 14 new checks for the rows the page marked "not covered yet":
+  `emit.listen_on_the_emitting_point`,
+  `request.refusal_keeps_earlier_effects`,
+  `local.queued_emits_run_in_order`, `local.panicking_waker_ignored`,
+  `defer.ask_wakes_its_thread`, `defer.listeners_read_at_the_drain`,
+  `timings.threaded_late_counts_the_wait`,
+  `journal.numbers_grow_by_one`, `journal.since_reports_the_gap`,
+  `journal.wait_and_wait_for`, `journal.cause_kept`,
+  `crossing.relay_implies_journal`, `crossing.lost_entries_reported`
+  and `crossing.ingested_not_echoed`. The gap checks publish up to
+  `WINDOW_PROBE` (16384) entries to push one out of the window; a
+  journal keeping more passes them without the gap being reached. The
+  kernel passed every new check: no kernel change.
+
 ## 0.2.0
 
 Implements bus-contract 0.4: crossing.

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0
+
+Implements bus-contract 0.5 and its capability contracts at 0.2
+(`bus-contract-defer`, `-timings`, `-journal`, `-crossing`). Breaking,
+as the contract is; bus-contract's `MIGRATION-0.5.md` covers the
+changes for users.
+
+- The capability traits and their types come from their contract
+  crates, re-exported at the crate root with each crate
+  (`bus_kernel::bus_contract_journal`, …) and its extension trait
+  (`BusDefer`, `BusTimings`, `BusJournal`, `BusCrossing`). The core
+  getters are gone: the extension traits go through `Kernel`'s
+  `Bus::capability`.
+- Declarations follow the contract's facets: `declare_point` runs the
+  journal and crossing contracts' checks on a point's facets and
+  refuses a facet whose contract the kernel does not offer
+  (`Refused::Unsupported`); `PointInfo::facets` replaces `journaled` and
+  `relayable`. A publish off a journaled point is refused with the
+  journal contract's `Refused::Contract`.
+- Validated ids: `declare_point` refuses a point id and `listen` /
+  `listen_local` a listener id that break the naming rule
+  (`<prefix>.<segment>…`, `check_id`) with `Refused::BadId`, and change
+  nothing. `after` / `before` targets are not checked.
+- Conformance: new core checks `id.declare_refuses_bad_ids`
+  (`core.id.point-checked`) and `id.listen_refuses_bad_ids`
+  (`core.id.listener-checked`). `capability.getter_and_lookup_agree` is
+  renamed `capability.extension_and_lookup_agree`: each capability is
+  reached through its extension trait and through the lookup with the
+  same answer, and `offers` agrees. The suite's listener ids carry the
+  `t.` prefix.
+- `conformance::GUARANTEES` is a copy of bus-contract 0.5.0's
+  `GUARANTEES.md`.
+
 ## 0.2.2
 
 The capability lookup of bus-contract 0.4.4; requires bus-contract 0.4.4.

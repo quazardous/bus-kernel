@@ -7,9 +7,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Condvar, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use bus_contract::{
-    Answer, Authority, Bus, Crossing, IngestError, Origin, PointKind, RelayedAnswer, RelayedAsk,
-    RelayedEntry,
+use bus_contract::{Bus, PointKind};
+use bus_contract_crossing::{
+    Answer, Authority, Crossing, IngestError, Origin, RelayedAnswer, RelayedAsk, RelayedEntry,
+    codec,
 };
 use web_time::Instant;
 
@@ -116,7 +117,7 @@ impl Kernel {
             });
         }
         if let Some((key, spec)) = self.declaration(&entry.kind) {
-            if key.kind != PointKind::Event || spec.relay.is_none() {
+            if key.kind != PointKind::Event || codec(&spec.facets).is_none() {
                 return Err(IngestError::NotRelayable { kind: entry.kind });
             }
             if spec.version != entry.version {
@@ -196,8 +197,8 @@ impl Kernel {
         let Some((key, spec)) = self.declaration(&ask.kind) else {
             return Answer::refused(format!("`{}` is not declared here", ask.kind));
         };
-        let codec = spec
-            .relay
+        let codec = codec(&spec.facets)
+            .copied()
             .filter(|c| key.kind == PointKind::Request && c.answers());
         let (Some(codec), Some(decode_value), Some(encode_value), Some(clone)) = (
             codec,

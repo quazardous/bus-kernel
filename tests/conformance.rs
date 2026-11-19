@@ -9,9 +9,11 @@ mod memory;
 
 use std::sync::Arc;
 
+use bus_kernel::Kernel;
 use bus_kernel::bus_contract::Bus;
 use bus_kernel::conformance::{self, Contract, Outcome};
-use bus_kernel::{Capability, Kernel};
+#[allow(unused_imports)]
+use bus_kernel::{BusCrossing, BusDefer, BusJournal, BusTimings};
 
 fn bare() -> Arc<dyn Bus> {
     Arc::new(Kernel::new())
@@ -54,7 +56,7 @@ fn checks_needing_a_missing_capability_are_skipped() {
     assert!(
         conformance::checks()
             .iter()
-            .any(|c| c.needs == [Capability::Defer])
+            .any(|c| c.needs == [&bus_kernel::bus_contract_defer::CONTRACT])
     );
 }
 
@@ -152,91 +154,12 @@ fn the_summary_names_contracts_checks_and_properties() {
     assert!(text.contains("timings.cost.low"));
     assert!(!text.contains("FAILED"));
 }
-
-/// A bus written before bus-contract 0.4.4: it overrides the `defer`
-/// getter and not `capability`, so the lookup does not see `Defer`.
-struct GetterOnly(Kernel);
-
-impl Bus for GetterOnly {
-    fn declare_point(
-        &self,
-        point: bus_kernel::bus_contract::PointKey,
-        spec: bus_kernel::bus_contract::PointSpec,
-    ) -> Result<(), bus_kernel::bus_contract::Refused> {
-        self.0.declare_point(point, spec)
-    }
-    fn listen_any(
-        &self,
-        point: bus_kernel::bus_contract::PointKey,
-        id: String,
-        opts: bus_kernel::bus_contract::ListenOpts,
-        run: bus_kernel::bus_contract::AnyListener,
-    ) -> Result<(), bus_kernel::bus_contract::Refused> {
-        Bus::listen_any(&self.0, point, id, opts, run)
-    }
-    fn listen_local_any(
-        &self,
-        point: bus_kernel::bus_contract::PointKey,
-        id: String,
-        opts: bus_kernel::bus_contract::ListenOpts,
-        run: bus_kernel::bus_contract::AnyLocalListener,
-    ) -> Result<(), bus_kernel::bus_contract::Refused> {
-        Bus::listen_local_any(&self.0, point, id, opts, run)
-    }
-    fn run_pending(&self) -> Vec<bus_kernel::bus_contract::PendingRun> {
-        Bus::run_pending(&self.0)
-    }
-    fn add_pending_waker(&self, wake: bus_kernel::bus_contract::PendingWaker) {
-        Bus::add_pending_waker(&self.0, wake);
-    }
-    fn unlisten(&self, point: &str, id: &str) -> bool {
-        Bus::unlisten(&self.0, point, id)
-    }
-    fn forget(&self, owner: &str) -> usize {
-        Bus::forget(&self.0, owner)
-    }
-    fn alter_any(
-        &self,
-        point: bus_kernel::bus_contract::PointKey,
-        input: bus_kernel::bus_contract::AnyInput,
-        value: bus_kernel::bus_contract::AnyValue,
-        clone: bus_kernel::bus_contract::CloneFn,
-    ) -> bus_kernel::bus_contract::Altered<bus_kernel::bus_contract::AnyValue> {
-        Bus::alter_any(&self.0, point, input, value, clone)
-    }
-    fn collect_any(
-        &self,
-        point: bus_kernel::bus_contract::PointKey,
-        input: bus_kernel::bus_contract::AnyInput,
-        fresh: bus_kernel::bus_contract::FreshFn,
-    ) -> bus_kernel::bus_contract::Collected<bus_kernel::bus_contract::AnyValue> {
-        Bus::collect_any(&self.0, point, input, fresh)
-    }
-    fn add_failure_sink(&self, sink: bus_kernel::bus_contract::FailureSink) {
-        Bus::add_failure_sink(&self.0, sink);
-    }
-    fn points(&self) -> Vec<bus_kernel::bus_contract::PointInfo> {
-        Bus::points(&self.0)
-    }
-    fn listeners(&self, point: &str) -> Option<Vec<bus_kernel::bus_contract::ListenerInfo>> {
-        Bus::listeners(&self.0, point)
-    }
-    fn defer(&self) -> Option<&dyn bus_kernel::bus_contract::Defer> {
-        self.0.defer()
-    }
-}
-
 #[test]
-fn a_getter_the_lookup_does_not_see_fails_the_agreement_check() {
+fn the_extension_traits_and_the_lookup_agree() {
     let check = conformance::checks()
         .iter()
-        .find(|c| c.name == "capability.getter_and_lookup_agree")
+        .find(|c| c.name == "capability.extension_and_lookup_agree")
         .expect("the check exists");
     assert_eq!(check.run(bare), Outcome::Passed);
     assert_eq!(check.run(hosted), Outcome::Passed);
-    let outcome = check.run(|| Arc::new(GetterOnly(Kernel::new())));
-    assert!(
-        matches!(outcome, Outcome::Failed(_)),
-        "a getter-only bus disagrees: {outcome:?}"
-    );
 }

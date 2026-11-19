@@ -6,16 +6,18 @@ guarantee, and which conformance check proves each property.
 The contract is split into five parts. **core** is the `Bus` trait,
 which every implementation offers. The four others are optional
 capabilities, which a bus may or may not offer: **defer**, **timings**,
-**journal** and **crossing** (`Relay`, on top of the journal). A bus
-offers a capability through its getter (`Bus::journal`, …) and through
-the typed lookup (`Bus::capability`, `bus.get::<dyn Journal>()`), and
-the two agree (`core.capability.lookup-agrees`).
+**journal** and **crossing** (`Relay`, on top of the journal). Each
+capability contract lives in a crate of its own (`bus-contract-defer`,
+`-timings`, `-journal`, `-crossing`). A bus offers a capability through
+the typed lookup (`Bus::capability`, `bus.get::<dyn Journal>()`), which
+the crate's extension trait (`bus.journal()`) goes through
+(`core.capability.lookup-agrees`).
 
 Each property has a **stable id**, `<contract>.<area>.<property>`. Ids
 are never reused for another meaning: a property that changes meaning
 gets a new id, and a property that is dropped keeps its id retired. The
 "Checked by" column names the check of the conformance suite of
-[`bus-kernel`](https://github.com/quazardous/bus-kernel) (0.2.2) that
+[`bus-kernel`](https://github.com/quazardous/bus-kernel) (0.3.0) that
 proves the property on any implementation, or says "not covered yet".
 "Partly" means the check covers part of the property, and the rest is
 named.
@@ -78,8 +80,8 @@ introspection.
 
 | Property | Guaranteed | Not guaranteed | Checked by |
 |---|---|---|---|
-| `core.declare.once-typed` | A point is declared once: a second declaration is refused (`Refused::AlreadyDeclared`). An id is registered with one `Point` type: a listener or emit with another type is refused (`Refused::TypeMismatch`) and runs no listener. | The naming rule for ids (`<crate>.<subject>.<moment>`) is documented, not enforced: ids are plain strings. | `declare.once_and_typed` |
-| `core.declare.table-checked` | `declare_all` refuses, with the point left undeclared, a point needing a capability the bus does not offer (`Refused::Unsupported`), a journaled point that is not an event (`NotEvent`), a relayable point that cannot cross (`NotCrossable`) and a codec of another point (`TypeMismatch`). | These checks are made by `declare_all`. A library that calls `declare_point` directly relies on what its implementation checks. | `declare.missing_capability_refused`; partly `crossing.declared_requests_fail_closed_alter_never` |
+| `core.declare.once-typed` | A point is declared once: a second declaration is refused (`Refused::AlreadyDeclared`). An id is registered with one `Point` type: a listener or emit with another type is refused (`Refused::TypeMismatch`) and runs no listener. | That two libraries keep to their own prefixes: the naming rule checks an id's shape (`core.id.point-checked`), not who owns its prefix. | `declare.once_and_typed` |
+| `core.declare.table-checked` | `declare_all` refuses, with the point left undeclared, a point needing a capability contract the bus does not offer, named in `needs` or through a facet, with the contracts it requires (`Refused::Unsupported`), and passes on what the bus refuses at declaration: a bad id (`Refused::BadId`), a facet its contract refuses (`Refused::Contract`: a journaled point that is not an event, a relayable point that cannot cross or carries another point's codec). | These checks are made by `declare_all`. A library that calls `declare_point` directly relies on what its implementation checks. | `declare.missing_capability_refused`; partly `crossing.declared_requests_fail_closed_alter_never` |
 | `core.order.declared` | Listeners run ordered by `after` / `before` first, then by priority (higher first), then by registration. | No order between two emits running at the same time on different threads. No order across points. | `order.constraints_priority_registration` |
 | `core.order.cycle-refused` | A listener whose `after` / `before` would close a cycle is refused (`Refused::Cycle`, with the path), with nothing changed. | | `order.cycle_refused_unchanged` |
 | `core.order.missing-target` | A constraint naming a listener that is not registered is accepted, reported by each emit (`FailureKind::MissingTarget`, not sent to the failure sinks) and by introspection, and ignored. The listener still runs and its edit counts. | | `order.missing_target_reported_ignored` |
@@ -102,11 +104,14 @@ introspection.
 | `core.local.error-boundary` | A deferred local listener that fails or panics is isolated as any other: its failure is reported by `run_pending`, and the others run. | | `local.error_boundary` |
 | `core.remove.no-run-after` | A listener removed by `unlisten` or `forget`, from any thread, never runs again, queued or not. `forget` removes every listener of an owner on every point. | | `remove.unlisten_and_forget`, `local.forget_from_any_thread` |
 | `core.introspect.points` | `points()` lists every point in id order with its listeners in run order; `listeners()` gives one point's. Each listener shows its owner, constraints, priority, effective deadline, threaded and local flags, missing targets, runs, failures and last failure. | Counters are not timings: durations belong to the timings capability. | `introspect.points_listeners_counters` |
-| `core.capability.lookup-agrees` | Each capability a bus offers (`Defer`, `Timings`, `Journal`, `Relay`) is reached through its getter (`defer()`, `timings()`, `journal()`, `relay()`) and through the lookup (`Bus::capability` with the `TypeId` of `dyn Defer`, …; typed: `capability::<dyn Defer, _>(bus)`, `bus.get::<dyn Defer>()`) with the same answer: both `None`, or both the same object. The getters default to the lookup, so a bus that implements only `capability` answers through both. A lookup answered with the cast of another capability gives `None`, never a wrong type. | A bus written before 0.4.4 that overrides the getters and not `capability` keeps working through the getters, `offers` and `declare_all`, but its lookup answers `None`, and the conformance check reports the mismatch until it implements `capability`. | `capability.getter_and_lookup_agree` |
+| `core.capability.lookup-agrees` | Each capability a bus offers (`Defer`, `Timings`, `Journal`, `Relay`) is reached through the lookup (`Bus::capability` with the `TypeId` of `dyn Defer`, …; typed: `capability::<dyn Defer, _>(bus)`, `bus.get::<dyn Defer>()`) and through its contract crate's extension trait (`BusDefer::defer`, `BusTimings::timings`, `BusJournal::journal`, `BusCrossing::relay`) with the same answer: both `None`, or both the same object; `offers(bus, &CONTRACT)` agrees. A lookup answered with the cast of another capability gives `None`, never a wrong type. | `offers` asks the lookup for the contract's `TypeId` only: a bus that answers it with a wrong cast is said to offer the contract while the typed lookup gives `None`. | `capability.extension_and_lookup_agree` |
+| `core.id.point-checked` | `declare_point` refuses a point key whose id breaks the naming rule (`check_id`: at least two dot-separated segments, none empty, the prefix `[a-z][a-z0-9_-]*`, the others `[A-Za-z0-9_-]+`) with `Refused::BadId`, and declares nothing. | Who owns a prefix: the rule checks the shape only. | `id.declare_refuses_bad_ids` |
+| `core.id.listener-checked` | `listen` and `listen_local` refuse a listener id that breaks the naming rule with `Refused::BadId`, with nothing changed. `after` / `before` targets are not checked (`LAST` is `*`). | | `id.listen_refuses_bad_ids` |
+| `core.id.const-checked` | `PointId::new` and `ListenerId::new` are `const fn`s that panic on a bad id, so a `const` made with one does not compile; `Point::ID` is a `PointId`. A property of the contract's types, not of a bus. | An id made at run time is checked when it is used (`try_new`, or by the bus). | not a bus property: bus-contract's `compile_fail` doc test on `PointId` |
 
 ## defer
 
-The `Defer` capability (`Bus::defer`): a request asked now, whose
+The `Defer` capability (`bus-contract-defer`, `BusDefer::defer`): a request asked now, whose
 listeners run at the next drain on the same thread.
 
 | Property | Guaranteed | Not guaranteed | Checked by |
@@ -119,7 +124,7 @@ listeners run at the next drain on the same thread.
 
 ## timings
 
-The `Timings` capability (`Bus::timings`): how long listeners take, per
+The `Timings` capability (`bus-contract-timings`, `BusTimings::timings`): how long listeners take, per
 point and per listener, and passes over a point's budget.
 
 | Property | Guaranteed | Not guaranteed | Checked by |
@@ -131,7 +136,7 @@ point and per listener, and passes over a point's budget.
 
 ## journal
 
-The `Journal` capability (`Bus::journal`): events of journaled points
+The `Journal` capability (`bus-contract-journal`, `BusJournal::journal`): events of journaled points
 kept with a number, read again from one, delivered after the publisher
 has moved on.
 
@@ -139,7 +144,7 @@ has moved on.
 |---|---|---|---|
 | `journal.seq.ordered` | Numbers start at 1 and increase by one with each entry, never reused while the process runs. The journal is ordered by them. | Numbers start again with the process. An implementation may also keep entries that are not events of a point (its own facts, events relayed in from a kind not declared here). | `journal.numbers_grow_by_one`, `journal.delivered_in_order_off_publisher` |
 | `journal.publish.never-waits` | Publishing records the entry and returns its number: it never runs a listener and never waits on one. | | `journal.delivered_in_order_off_publisher` |
-| `journal.publish.journaled-only` | Publishing on a point not declared journaled on this bus is refused (`Refused::NotJournaled`), as is one declared with another type (`TypeMismatch`), with nothing recorded. | | `journal.refuses_off_journaled` |
+| `journal.publish.journaled-only` | Publishing on a point not declared journaled on this bus is refused (`Refused::Contract` from the journal contract, `bus_contract_journal::not_journaled`), as is one declared with another type (`TypeMismatch`), with nothing recorded. | | `journal.refuses_off_journaled` |
 | `journal.delivery.once-in-order` | Each entry of a journaled point is delivered to the point's listeners once, entries in number order, each as a collect emit (every core rule holds), on a thread of the implementation's, not the publisher's. | A slow listener delays the following entries, never the publisher; deadlines bound it. Exactly-once holds inside one process only. | `journal.delivered_in_order_off_publisher`; local listeners queued from the pump: not covered yet |
 | `journal.read.since` | `since(seq, limit)` returns the entries after `seq`, oldest first, and reports a gap when some were dropped from the window before the read. | | `journal.delivered_in_order_off_publisher`, `journal.since_reports_the_gap` (the gap on a window of up to 16384 entries) |
 | `journal.read.wait-flush` | `wait` returns the first entry after a number matching one of the patterns, at once if it is already there, else waiting up to a timeout. `flush` waits until every entry recorded before the call is delivered, up to a timeout. A cause given to `publish_caused` is kept on the entry. | | `journal.wait_and_wait_for`, `journal.cause_kept`; `flush`: used by `journal.delivered_in_order_off_publisher` |
@@ -147,15 +152,15 @@ has moved on.
 
 ## crossing
 
-The `Relay` capability (`Bus::relay`), on top of the journal: what may
+The `Relay` capability (`bus-contract-crossing`, `BusCrossing::relay`), on top of the journal: what may
 cross a process boundary and what it means when it does. The transport
 (framing, sockets, reconnection, discovery) is not part of the
 contract.
 
 | Property | Guaranteed | Not guaranteed | Checked by |
 |---|---|---|---|
-| `crossing.relay.implies-journal` | A bus that offers `Relay` offers `Journal`; `offers(bus, Capability::Relay)` checks both. | | `crossing.relay_implies_journal` |
-| `crossing.declare.what-crosses` | Only an event point (with `Codec::of`) or a request point (with `Codec::request`, which writes the value too) crosses. A relayable event is journaled; a relayable request is fail-closed and not journaled. Alter and collect points never cross (`Refused::NotCrossable`). | | `crossing.declared_requests_fail_closed_alter_never` |
+| `crossing.relay.implies-journal` | A bus that offers `Relay` offers `Journal`; the crossing `CONTRACT` requires the journal one, and `offers(bus, &bus_contract_crossing::CONTRACT)` checks both. | | `crossing.relay_implies_journal` |
+| `crossing.declare.what-crosses` | Only an event point (with `Codec::of`, `relayable_event`) or a request point (with `Codec::request`, which writes the value too, `relayable_request`) crosses. A relayable event is journaled; a relayable request is fail-closed and not journaled (`bus_contract_crossing::applied`). Alter and collect points never cross, nor a point with another point's codec (`Refused::Contract` from the crossing contract, `bus_contract_crossing::check`). | | `crossing.declared_requests_fail_closed_alter_never` |
 | `crossing.version.same-only` | Two processes cross a point only at the same version: an entry or an ask of another version is refused (`IngestError::Version`, or a refused answer). | Compatibility inside a version is the codec's job: a decoder should accept fields it does not know. | `crossing.same_version_only` |
 | `crossing.resume.cursor-order` | `resume` returns the relayable entries after the cursor, in number order, each written by its codec with its version, at most `limit`, and the cursor to resume from. | | `relay.resume_and_ingest` |
 | `crossing.resume.lost-reported` | A cursor of another run gets the run's entries from its start with `Lost::Restarted`; a cursor whose next entries left the window gets the kept ones with `Lost::Gap`. `Cursor::START` loses nothing. | Lost entries are not sent again: the reader resyncs from the current state. | `crossing.lost_entries_reported` (the gap on a window of up to 16384 entries) |

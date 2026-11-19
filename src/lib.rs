@@ -26,19 +26,40 @@ use web_time::Instant;
 /// below under their old paths.
 pub use bus_contract;
 pub use bus_contract::{
-    Altered, Answer, Authority, Capability, Codec, Collected, Crossing, Cursor, DEFAULT_DEADLINE,
-    Defer, FAILED_FACT, Failure, FailureKind, HookError, IngestError, Journal, JournalEntry, LAST,
-    ListenOpts, ListenerInfo, ListenerTimings, Lost, OVER_BUDGET_FACT, Origin, OverBudget,
-    PLUGIN_DEADLINE, PendingRun, Point, PointDecl, PointInfo, PointKind, PointSpec, PointTimings,
-    Refusal, Refused, Relay, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest,
-    Resumed, Since, TimingStats, Timings, ask_run, declare_all, far_listener, kind_matches,
-    missing_targets, offers, order_dump,
+    Altered, Collected, Contract, DEFAULT_DEADLINE, FAILED_FACT, Facet, Failure, FailureKind,
+    HookError, IdError, LAST, ListenOpts, ListenerId, ListenerInfo, PLUGIN_DEADLINE, PendingRun,
+    Point, PointDecl, PointId, PointInfo, PointKind, PointSpec, Refusal, Refused, check_id,
+    declare_all, missing_targets, offers, order_dump,
 };
 use bus_contract::{
-    AnyInput, AnyListener, AnyLocalListener, AnyValue, BudgetSink, Bus, Cast, CloneFn, FailureSink,
-    FreshFn, PendingWaker, PointKey, Provided,
+    AnyInput, AnyListener, AnyLocalListener, AnyValue, Bus, Cast, CloneFn, FailureSink, FreshFn,
+    PendingWaker, PointKey, Provided,
+};
+/// The capability contracts this kernel implements, and their items
+/// re-exported under the kernel's root as before.
+pub use bus_contract_crossing::{
+    self, Answer, Authority, BusCrossing, Codec, Crossing, Cursor, IngestError, Lost, Relay,
+    Relayed, RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest, Resumed, ask_run,
+    far_listener,
+};
+pub use bus_contract_defer::{self, BusDefer, Defer};
+pub use bus_contract_journal::{
+    self, BusJournal, JOURNALED, Journal, JournalEntry, Origin, Since, kind_matches,
+};
+use bus_contract_timings::BudgetSink;
+pub use bus_contract_timings::{
+    self, BusTimings, ListenerTimings, OVER_BUDGET_FACT, OverBudget, PointTimings, TimingStats,
+    Timings,
 };
 use timing::Stats;
+
+/// Refuses a listener id that breaks the naming rule ([`check_id`]).
+fn check_listener_id(id: &str) -> Result<(), Refused> {
+    check_id(id).map_err(|error| Refused::BadId {
+        id: id.to_owned(),
+        error,
+    })
+}
 
 thread_local! {
     /// The local listeners registered on this thread, by kernel and
@@ -324,12 +345,12 @@ impl Kernel {
     }
 
     /// The kernel with the host's journal: it offers the contract's
-    /// [`Journal`] capability ([`Bus::journal`]), so points may be
-    /// declared journaled ([`PointDecl::journaled`]).
+    /// [`Journal`] capability ([`BusJournal::journal`]), so points may be
+    /// declared journaled ([`bus_contract_journal::JOURNALED`]).
     ///
     /// The kernel answers [`Journal`] itself: a publish to a point it
     /// does not hold declared journaled, or under another type, is
-    /// refused there ([`Refused::NotJournaled`], [`Refused::TypeMismatch`]);
+    /// refused there ([`bus_contract_journal::not_journaled`], [`Refused::TypeMismatch`]);
     /// everything else goes to `journal`. The host's journal keeps the
     /// entries and runs the pump: each entry of a journaled point is
     /// delivered by a collect emit on this kernel
@@ -352,9 +373,9 @@ impl Kernel {
     }
 
     /// The kernel with the host's relay: it offers the contract's
-    /// [`Relay`] capability ([`Bus::relay`]) when it has a journal too
+    /// [`Relay`] capability ([`BusCrossing::relay`]) when it has a journal too
     /// ([`Kernel::with_journal`]), so points may be declared relayable
-    /// ([`PointDecl::relayable`]): events, and requests another process
+    /// ([`bus_contract_crossing::relayable`]): events, and requests another process
     /// may ask.
     ///
     /// The host keeps and reads entries ([`RelayHost`]); the kernel
@@ -403,38 +424,24 @@ impl Kernel {
         self.declare_point(PointKey::of::<P>(), spec)
     }
 
-    /// Declares a point by its key ([`Bus::declare_point`]). A journaled
-    /// point that is not an event, or a journaled or relayable point the
-    /// kernel cannot serve (no journal or relay from the host), is
-    /// refused, as [`declare_all`] would.
+    /// Declares a point by its key ([`Bus::declare_point`]). Refused
+    /// when its id breaks the naming rule ([`Refused::BadId`]), when a
+    /// facet's contract refuses it (a journaled point that is not an
+    /// event, a relayable point that cannot cross), and when it has a
+    /// facet of a contract the kernel does not offer here (no journal or
+    /// relay from the host), as [`declare_all`] would.
     pub fn declare_point(&self, key: PointKey, spec: PointSpec) -> Result<(), Refused> {
-        if spec.journaled && key.kind != PointKind::Event {
-            return Err(Refused::NotEvent { point: key.id });
-        }
-        if let Some(codec) = spec.relay {
-            if codec.point != key.id {
-                return Err(Refused::TypeMismatch { point: key.id });
-            }
-            let crosses = match key.kind {
-                PointKind::Event => true,
-                PointKind::Request => codec.answers(),
-                _ => false,
-            };
-            if !crosses {
-                return Err(Refused::NotCrossable { point: key.id });
-            }
-        }
-        let needs = [
-            (spec.journaled, Capability::Journal),
-            (spec.relay.is_some(), Capability::Relay),
-        ];
-        if let Some((_, capability)) = needs
-            .into_iter()
-            .find(|(needed, c)| *needed && !offers(self, *c))
-        {
+        check_id(key.id).map_err(|error| Refused::BadId {
+            id: key.id.to_owned(),
+            error,
+        })?;
+        bus_contract_journal::check(&key, &spec)?;
+        bus_contract_crossing::check(&key, &spec)?;
+        let spec = bus_contract_crossing::applied(&key, spec);
+        if let Some(facet) = spec.facets.iter().find(|f| !offers(self, f.contract)) {
             return Err(Refused::Unsupported {
                 point: key.id,
-                capability,
+                contract: facet.contract.name,
             });
         }
         let mut points = self.write();
@@ -480,6 +487,7 @@ impl Kernel {
         opts: ListenOpts,
         run: AnyListener,
     ) -> Result<(), Refused> {
+        check_listener_id(&id)?;
         self.add(key, id, opts, Run::Shared(run)).map(|_| ())
     }
 
@@ -510,6 +518,7 @@ impl Kernel {
         opts: ListenOpts,
         run: AnyLocalListener,
     ) -> Result<(), Refused> {
+        check_listener_id(&id)?;
         if opts.threaded {
             return Err(Refused::Threaded {
                 point: key.id,
@@ -1177,8 +1186,7 @@ impl Kernel {
             info.declared = true;
             info.fail_closed = spec.fail_closed;
             info.budget = spec.budget;
-            info.journaled = spec.journaled;
-            info.relayable = spec.relay.is_some();
+            info.facets = spec.facets.clone();
             info.version = spec.version;
         }
         info.deadline = deadline;
@@ -1488,8 +1496,8 @@ impl Bus for Kernel {
 
     /// `Defer` and `Timings` always; `Journal` with a journal
     /// ([`Kernel::with_journal`]); `Relay` with a journal and a relay.
-    /// The getters (`defer()`, …) keep their default, this lookup, so the
-    /// two always agree.
+    /// The contract crates' extension traits (`BusDefer::defer`, …) go
+    /// through this lookup, so the two always agree.
     fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
         if contract == TypeId::of::<dyn Defer>() {
             Some(Provided::new::<dyn Defer>(self, &AS_DEFER))
@@ -1541,14 +1549,16 @@ impl Journal for Kernel {
         cause: Option<u64>,
     ) -> Result<u64, Refused> {
         let Some(journal) = &self.journal else {
-            return Err(Refused::NotJournaled { point: point.id });
+            return Err(bus_contract_journal::not_journaled(point.id));
         };
         match self.declaration(point.id) {
             Some((key, _)) if key.type_id != point.type_id => {
                 Err(Refused::TypeMismatch { point: point.id })
             }
-            Some((_, spec)) if spec.journaled => journal.publish_any(point, input, fresh, cause),
-            _ => Err(Refused::NotJournaled { point: point.id }),
+            Some((_, spec)) if bus_contract_journal::is_journaled(&spec.facets) => {
+                journal.publish_any(point, input, fresh, cause)
+            }
+            _ => Err(bus_contract_journal::not_journaled(point.id)),
         }
     }
 

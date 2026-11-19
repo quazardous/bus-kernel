@@ -30,7 +30,7 @@
 //!
 //! Each check builds the buses it needs with `make`, fresh ones, so a
 //! check never sees another's points. A check needing a capability the
-//! bus does not offer ([`Capability`]) is skipped, not failed. Times are
+//! bus does not offer ([`Need`]) is skipped, not failed. Times are
 //! checked as lower bounds or with wide margins: a loaded machine makes
 //! runs longer, never shorter.
 
@@ -45,11 +45,23 @@ use std::time::Duration;
 use web_time::Instant;
 
 use bus_contract::{
-    Answer, Bus, Capability, Codec, Cursor, FailureKind, HookError, IngestError, LAST, ListenOpts,
-    Lost, Origin, OverBudget, Point, PointDecl, PointKey, PointKind, PointSpec, Refused, Relayed,
-    RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest, declare_all, far_listener, offers,
-    order_dump,
+    Bus, Facet, FailureKind, HookError, LAST, ListenOpts, Point, PointDecl, PointId, PointKey,
+    PointKind, PointSpec, Refused, declare_all, offers, order_dump,
 };
+use bus_contract_crossing::{
+    Answer, BusCrossing, Codec, Cursor, IngestError, Lost, Origin, Relayed, RelayedAnswer,
+    RelayedAsk, RelayedEntry, RelayedRequest, Resumed, far_listener, relayable,
+};
+use bus_contract_defer::BusDefer;
+use bus_contract_journal::{BusJournal, JOURNALED};
+use bus_contract_timings::{BusTimings, OverBudget};
+
+/// A capability contract, as data ([`bus_contract::Contract`]).
+pub type Need = &'static bus_contract::Contract;
+const DEFER: Need = &bus_contract_defer::CONTRACT;
+const TIMINGS: Need = &bus_contract_timings::CONTRACT;
+const JOURNAL: Need = &bus_contract_journal::CONTRACT;
+const RELAY: Need = &bus_contract_crossing::CONTRACT;
 
 /// Builds a fresh bus for a check.
 pub type Make = fn() -> Arc<dyn Bus>;
@@ -95,13 +107,13 @@ impl Contract {
     }
 
     /// The capabilities a bus offers when it offers this contract.
-    pub const fn needs(self) -> &'static [Capability] {
+    pub const fn needs(self) -> &'static [Need] {
         match self {
             Contract::Core => &[],
-            Contract::Defer => &[Capability::Defer],
-            Contract::Timings => &[Capability::Timings],
-            Contract::Journal => &[Capability::Journal],
-            Contract::Crossing => &[Capability::Journal, Capability::Relay],
+            Contract::Defer => &[DEFER],
+            Contract::Timings => &[TIMINGS],
+            Contract::Journal => &[JOURNAL],
+            Contract::Crossing => &[JOURNAL, RELAY],
         }
     }
 }
@@ -142,7 +154,7 @@ pub struct Check {
     /// Its name, stable: `group.what`.
     pub name: &'static str,
     /// The capabilities it needs; without one, it is skipped.
-    pub needs: &'static [Capability],
+    pub needs: &'static [Need],
     /// The contract it belongs to.
     pub contract: Contract,
     /// The property ids of the guarantees page ([`properties`]) it
@@ -167,8 +179,9 @@ impl fmt::Debug for Check {
 pub enum Outcome {
     /// It held.
     Passed,
-    /// The bus does not offer this capability: not run.
-    Skipped(Capability),
+    /// The bus does not offer this capability contract (its name): not
+    /// run.
+    Skipped(&'static str),
     /// It did not hold: the assertion's message.
     Failed(String),
 }
@@ -178,8 +191,8 @@ impl Check {
     /// failure.
     pub fn run(&self, make: Make) -> Outcome {
         let probe = make();
-        if let Some(missing) = self.needs.iter().find(|c| !offers(&*probe, **c)) {
-            return Outcome::Skipped(*missing);
+        if let Some(missing) = self.needs.iter().find(|c| !offers(&*probe, c)) {
+            return Outcome::Skipped(missing.name);
         }
         drop(probe);
         match catch_unwind(AssertUnwindSafe(|| (self.body)(make))) {
@@ -449,9 +462,21 @@ const CHECKS: &[Check] = &[
     ),
     check(
         Core,
-        "capability.getter_and_lookup_agree",
+        "capability.extension_and_lookup_agree",
         &["core.capability.lookup-agrees"],
-        capability_getter_and_lookup_agree,
+        capability_extension_and_lookup_agree,
+    ),
+    check(
+        Core,
+        "id.declare_refuses_bad_ids",
+        &["core.id.point-checked"],
+        id_declare_refuses_bad_ids,
+    ),
+    check(
+        Core,
+        "id.listen_refuses_bad_ids",
+        &["core.id.listener-checked"],
+        id_listen_refuses_bad_ids,
     ),
     // defer
     check(
@@ -662,14 +687,14 @@ const CHECKS: &[Check] = &[
 
 struct Trail;
 impl Point for Trail {
-    const ID: &'static str = "conformance.trail";
+    const ID: PointId = PointId::new("conformance.trail");
     type Input = ();
     type Value = Vec<String>;
 }
 
 struct Parts;
 impl Point for Parts {
-    const ID: &'static str = "conformance.parts";
+    const ID: PointId = PointId::new("conformance.parts");
     type Input = u32;
     type Value = Vec<u32>;
 }
@@ -677,14 +702,14 @@ impl Point for Parts {
 /// `Trail`'s id, another type.
 struct Impostor;
 impl Point for Impostor {
-    const ID: &'static str = "conformance.trail";
+    const ID: PointId = PointId::new("conformance.trail");
     type Input = ();
     type Value = u8;
 }
 
 struct Run;
 impl Point for Run {
-    const ID: &'static str = "conformance.run";
+    const ID: PointId = PointId::new("conformance.run");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -692,7 +717,7 @@ impl Point for Run {
 
 struct Step;
 impl Point for Step {
-    const ID: &'static str = "conformance.step";
+    const ID: PointId = PointId::new("conformance.step");
     const KIND: PointKind = PointKind::Event;
     type Input = u32;
     type Value = ();
@@ -700,7 +725,7 @@ impl Point for Step {
 
 struct Plain;
 impl Point for Plain {
-    const ID: &'static str = "conformance.plain";
+    const ID: PointId = PointId::new("conformance.plain");
     const KIND: PointKind = PointKind::Event;
     type Input = String;
     type Value = ();
@@ -708,7 +733,7 @@ impl Point for Plain {
 
 struct Shared;
 impl Point for Shared {
-    const ID: &'static str = "conformance.shared";
+    const ID: PointId = PointId::new("conformance.shared");
     const KIND: PointKind = PointKind::Event;
     type Input = u32;
     type Value = ();
@@ -726,8 +751,25 @@ impl Relayed for Shared {
 const WAIT: Duration = Duration::from_secs(10);
 const MS: Duration = Duration::from_millis(1);
 
+/// The listener id the checks register `name` under: the naming rule
+/// wants a `<crate>.` prefix ([`bus_contract::check_id`]).
+fn lid(name: &str) -> String {
+    if name.contains('.') || name == LAST {
+        name.to_owned()
+    } else {
+        format!("t.{name}")
+    }
+}
+
+/// `opts` with its `after` / `before` targets named as [`lid`] does.
+fn lopts(mut opts: ListenOpts) -> ListenOpts {
+    opts.after = opts.after.iter().map(|a| lid(a)).collect();
+    opts.before = opts.before.iter().map(|b| lid(b)).collect();
+    opts
+}
+
 fn push(bus: &dyn Bus, id: &'static str, opts: ListenOpts) {
-    bus.listen::<Trail>(id, opts, move |_, v| {
+    bus.listen::<Trail>(lid(id), lopts(opts), move |_, v| {
         v.push(id.to_owned());
         Ok(())
     })
@@ -738,7 +780,7 @@ fn ids(bus: &dyn Bus, point: &str) -> Vec<String> {
     bus.listeners(point)
         .unwrap_or_default()
         .into_iter()
-        .map(|l| l.id)
+        .map(|l| l.id.strip_prefix("t.").map(str::to_owned).unwrap_or(l.id))
         .collect()
 }
 
@@ -749,14 +791,14 @@ fn declare_once_and_typed(make: Make) {
     push(&*bus, "a", ListenOpts::new());
     assert!(
         matches!(
-            bus.listen::<Trail>("a", ListenOpts::new(), |_, _| Ok(())),
+            bus.listen::<Trail>("t.a", ListenOpts::new(), |_, _| Ok(())),
             Err(Refused::Duplicate { .. })
         ),
         "a listener id taken on the point is refused"
     );
     assert!(
         matches!(
-            bus.listen::<Impostor>("x", ListenOpts::new(), |_, _| Ok(())),
+            bus.listen::<Impostor>("t.x", ListenOpts::new(), |_, _| Ok(())),
             Err(Refused::TypeMismatch { .. })
         ),
         "a listener under another type is refused"
@@ -783,32 +825,27 @@ fn declare_once_and_typed(make: Make) {
 
 fn missing_capability_refused(make: Make) {
     let bus = make();
-    for capability in [
-        Capability::Defer,
-        Capability::Timings,
-        Capability::Journal,
-        Capability::Relay,
-    ] {
-        if offers(&*bus, capability) {
+    for contract in [DEFER, TIMINGS, JOURNAL, RELAY] {
+        if offers(&*bus, contract) {
             continue;
         }
-        let needs: &'static [Capability] = match capability {
-            Capability::Defer => &[Capability::Defer],
-            Capability::Timings => &[Capability::Timings],
-            Capability::Journal => &[Capability::Journal],
-            _ => &[Capability::Relay],
+        let needs: &'static [Need] = match contract.name {
+            "defer" => &[DEFER],
+            "timings" => &[TIMINGS],
+            "journal" => &[JOURNAL],
+            _ => &[RELAY],
         };
         let table = [PointDecl::of::<Trail>("needs").needs(needs)];
         let refused = declare_all(&*bus, &table);
         assert!(
-            matches!(&refused[..], [Refused::Unsupported { capability: c, .. }] if *c == capability),
-            "a point needing {capability:?} is refused: {refused:?}"
+            matches!(&refused[..], [Refused::Unsupported { contract: c, .. }] if *c == contract.name),
+            "a point needing {contract:?} is refused: {refused:?}"
         );
     }
-    if !offers(&*bus, Capability::Journal) {
+    if !offers(&*bus, JOURNAL) {
         assert!(
             matches!(
-                bus.declare::<Step>(PointSpec::new("steps").journaled()),
+                bus.declare::<Step>(PointSpec::new("steps").facet(JOURNALED)),
                 Err(Refused::Unsupported { .. })
             ),
             "a journaled point without the Journal capability is refused"
@@ -820,20 +857,20 @@ fn missing_capability_refused(make: Make) {
 
 fn order_constraints_priority_registration(make: Make) {
     let bus = make();
-    push(&*bus, "late", ListenOpts::new().after("core"));
+    push(&*bus, "late", ListenOpts::new().after("t.core"));
     push(&*bus, "core", ListenOpts::new());
     push(&*bus, "first", ListenOpts::new().priority(5));
     push(
         &*bus,
         "guard",
-        ListenOpts::new().before("core").priority(-9),
+        ListenOpts::new().before("t.core").priority(-9),
     );
     push(&*bus, "tail", ListenOpts::new());
     let out = bus.alter::<Trail>((), Vec::new());
     assert!(out.failures.is_empty(), "{:?}", out.failures);
     assert_eq!(out.value, ["first", "tail", "guard", "core", "late"]);
     assert_eq!(
-        ids(&*bus, Trail::ID),
+        ids(&*bus, Trail::ID.as_str()),
         out.value,
         "introspection, same order"
     );
@@ -841,15 +878,15 @@ fn order_constraints_priority_registration(make: Make) {
 
 fn order_cycle_refused_unchanged(make: Make) {
     let bus = make();
-    push(&*bus, "a", ListenOpts::new().after("b"));
+    push(&*bus, "a", ListenOpts::new().after("t.b"));
     let refused = bus
-        .listen::<Trail>("b", ListenOpts::new().after("a"), |_, _| Ok(()))
+        .listen::<Trail>("t.b", ListenOpts::new().after("t.a"), |_, _| Ok(()))
         .unwrap_err();
     assert!(matches!(refused, Refused::Cycle { .. }), "{refused:?}");
-    assert_eq!(ids(&*bus, Trail::ID), ["a"], "nothing changed");
+    assert_eq!(ids(&*bus, Trail::ID.as_str()), ["a"], "nothing changed");
     assert!(
         matches!(
-            bus.listen::<Trail>("me", ListenOpts::new().before("me"), |_, _| Ok(())),
+            bus.listen::<Trail>("t.me", ListenOpts::new().before("t.me"), |_, _| Ok(())),
             Err(Refused::Cycle { .. })
         ),
         "itself as a target is a cycle"
@@ -858,16 +895,19 @@ fn order_cycle_refused_unchanged(make: Make) {
 
 fn order_missing_target_reported_ignored(make: Make) {
     let bus = make();
-    push(&*bus, "a", ListenOpts::new().after("ghost").owner("m"));
+    push(&*bus, "a", ListenOpts::new().after("t.ghost").owner("m"));
     let out = bus.alter::<Trail>((), Vec::new());
     assert_eq!(out.value, ["a"]);
     assert_eq!(out.failures.len(), 1);
     assert_eq!(
         out.failures[0].kind,
-        FailureKind::MissingTarget("ghost".into())
+        FailureKind::MissingTarget("t.ghost".into())
     );
     assert!(!out.failures[0].dropped(), "the listener still ran");
-    assert_eq!(bus.listeners(Trail::ID).unwrap()[0].missing, ["ghost"]);
+    assert_eq!(
+        bus.listeners(Trail::ID.as_str()).unwrap()[0].missing,
+        ["t.ghost"]
+    );
     push(&*bus, "ghost", ListenOpts::new().priority(-1));
     let out = bus.alter::<Trail>((), Vec::new());
     assert!(out.failures.is_empty());
@@ -881,16 +921,16 @@ fn order_last_runs_after_all_alone(make: Make) {
     push(
         &*bus,
         "late",
-        ListenOpts::new().after("early").priority(-10),
+        ListenOpts::new().after("t.early").priority(-10),
     );
     let out = bus.alter::<Trail>((), Vec::new());
     assert_eq!(out.value, ["early", "late", "check"]);
     assert!(out.failures.is_empty(), "LAST is no missing target");
-    let listeners = bus.listeners(Trail::ID).unwrap();
+    let listeners = bus.listeners(Trail::ID.as_str()).unwrap();
     assert!(listeners[2].after.iter().any(|a| a == LAST));
     assert!(
         matches!(
-            bus.listen::<Trail>("check-too", ListenOpts::new().last(), |_, _| Ok(())),
+            bus.listen::<Trail>("t.check-too", ListenOpts::new().last(), |_, _| Ok(())),
             Err(Refused::Cycle { .. })
         ),
         "two LAST listeners are a cycle"
@@ -902,12 +942,12 @@ fn order_last_runs_after_all_alone(make: Make) {
 fn alter_keeps_successful_edits(make: Make) {
     let bus = make();
     push(&*bus, "one", ListenOpts::new());
-    bus.listen::<Trail>("fails", ListenOpts::new(), |_, v| {
+    bus.listen::<Trail>("t.fails", ListenOpts::new(), |_, v| {
         v.push("half".into());
         Err("refused".into())
     })
     .unwrap();
-    bus.listen::<Trail>("panics", ListenOpts::new(), |_, v| {
+    bus.listen::<Trail>("t.panics", ListenOpts::new(), |_, v| {
         v.clear();
         panic!("boom");
     })
@@ -928,17 +968,17 @@ fn alter_keeps_successful_edits(make: Make) {
 
 fn collect_gathers_fresh_parts(make: Make) {
     let bus = make();
-    bus.listen::<Parts>("double", ListenOpts::new(), |n, out| {
+    bus.listen::<Parts>("t.double", ListenOpts::new(), |n, out| {
         out.push(n * 2);
         Ok(())
     })
     .unwrap();
-    bus.listen::<Parts>("partial", ListenOpts::new().priority(1), |n, out| {
+    bus.listen::<Parts>("t.partial", ListenOpts::new().priority(1), |n, out| {
         out.push(*n);
         Err("incomplete".into())
     })
     .unwrap();
-    bus.listen::<Parts>("square", ListenOpts::new(), |n, out| {
+    bus.listen::<Parts>("t.square", ListenOpts::new(), |n, out| {
         assert!(out.is_empty(), "each listener starts from a fresh value");
         out.extend([n * n, 1]);
         Ok(())
@@ -948,12 +988,12 @@ fn collect_gathers_fresh_parts(make: Make) {
     assert_eq!(
         out.parts,
         [
-            ("double".to_string(), vec![6]),
-            ("square".to_string(), vec![9, 1])
+            ("t.double".to_string(), vec![6]),
+            ("t.square".to_string(), vec![9, 1])
         ]
     );
     let failed: Vec<_> = out.failures.iter().map(|f| f.listener.as_str()).collect();
-    assert_eq!(failed, ["partial"]);
+    assert_eq!(failed, ["t.partial"]);
 }
 
 fn failure_sinks_hear_dropped_only(make: Make) {
@@ -962,28 +1002,28 @@ fn failure_sinks_hear_dropped_only(make: Make) {
     let sink = seen.clone();
     bus.on_failure(move |f| sink.lock().unwrap().push(f.listener.clone()));
     bus.on_failure(|_| panic!("a broken sink"));
-    push(&*bus, "ok", ListenOpts::new().after("ghost"));
-    bus.listen::<Trail>("bad", ListenOpts::new(), |_, _| Err("no disk".into()))
+    push(&*bus, "ok", ListenOpts::new().after("t.ghost"));
+    bus.listen::<Trail>("t.bad", ListenOpts::new(), |_, _| Err("no disk".into()))
         .unwrap();
     let out = bus.alter::<Trail>((), Vec::new());
     assert_eq!(out.failures.len(), 2);
     assert_eq!(out.value, ["ok"], "a panicking sink stops nothing");
-    assert_eq!(*seen.lock().unwrap(), ["bad"]);
+    assert_eq!(*seen.lock().unwrap(), ["t.bad"]);
 }
 
 fn reentrant_and_cross_thread(make: Make) {
     let bus = make();
-    bus.listen::<Parts>("n", ListenOpts::new(), |n, out| {
+    bus.listen::<Parts>("t.n", ListenOpts::new(), |n, out| {
         out.push(*n);
         Ok(())
     })
     .unwrap();
     let inner = bus.clone();
-    bus.listen::<Trail>("reenter", ListenOpts::new(), move |_, v| {
+    bus.listen::<Trail>("t.reenter", ListenOpts::new(), move |_, v| {
         let got = inner.collect::<Parts>(9);
         v.push(format!("{:?}", got.parts[0].1));
         inner
-            .listen::<Parts>("added", ListenOpts::new(), |_, _| Ok(()))
+            .listen::<Parts>("t.added", ListenOpts::new(), |_, _| Ok(()))
             .map_err(|e| e.to_string().into())
     })
     .unwrap();
@@ -1005,7 +1045,7 @@ fn reentrant_and_cross_thread(make: Make) {
 
 fn guarded(bus: &dyn Bus, policy: impl Fn(&str) -> Result<(), HookError> + Send + Sync + 'static) {
     bus.listen::<Run>(
-        "policy",
+        "t.policy",
         ListenOpts::new().owner("policy"),
         move |cmd, did| {
             did.push("policy".into());
@@ -1013,10 +1053,14 @@ fn guarded(bus: &dyn Bus, policy: impl Fn(&str) -> Result<(), HookError> + Send 
         },
     )
     .unwrap();
-    bus.listen::<Run>("handler", ListenOpts::new().after("policy"), |cmd, did| {
-        did.push(format!("ran {cmd}"));
-        Ok(())
-    })
+    bus.listen::<Run>(
+        "t.handler",
+        ListenOpts::new().after("t.policy"),
+        |cmd, did| {
+            did.push(format!("ran {cmd}"));
+            Ok(())
+        },
+    )
     .unwrap();
 }
 
@@ -1040,7 +1084,7 @@ fn refusal_stops_not_a_failure(make: Make) {
     assert!(out.value.is_empty(), "the refusing edit is dropped too");
     assert!(out.failures.is_empty());
     let refusal = out.refused.expect("refused");
-    assert_eq!(refusal.listener, "policy");
+    assert_eq!(refusal.listener, "t.policy");
     assert_eq!(refusal.owner.as_deref(), Some("policy"));
     assert_eq!(refusal.reason, "may not delete");
     assert!(!refusal.failed);
@@ -1056,11 +1100,11 @@ fn refusal_stops_not_a_failure(make: Make) {
 
 fn refusal_off_a_request_fails(make: Make) {
     let bus = make();
-    bus.listen::<Trail>("picky", ListenOpts::new(), |_, _| {
+    bus.listen::<Trail>("t.picky", ListenOpts::new(), |_, _| {
         Err(HookError::refuse("no"))
     })
     .unwrap();
-    push(&*bus, "after", ListenOpts::new().after("picky"));
+    push(&*bus, "after", ListenOpts::new().after("t.picky"));
     let out = bus.alter::<Trail>((), vec![]);
     assert_eq!(out.value, ["after"]);
     assert!(out.refused.is_none());
@@ -1087,7 +1131,7 @@ fn fail_closed_refuses(make: Make) {
     assert!(
         bus.points()
             .iter()
-            .any(|p| p.id == Run::ID && p.fail_closed)
+            .any(|p| p.id == Run::ID.as_str() && p.fail_closed)
     );
 
     let bus = make();
@@ -1105,11 +1149,11 @@ fn unlisten_and_forget(make: Make) {
     let bus = make();
     push(&*bus, "a", ListenOpts::new().owner("plugin"));
     push(&*bus, "b", ListenOpts::new());
-    bus.listen::<Parts>("c", ListenOpts::new().owner("plugin"), |_, _| Ok(()))
+    bus.listen::<Parts>("t.c", ListenOpts::new().owner("plugin"), |_, _| Ok(()))
         .unwrap();
     assert_eq!(bus.forget("plugin"), 2);
-    assert!(bus.unlisten(Trail::ID, "b"));
-    assert!(!bus.unlisten(Trail::ID, "b"));
+    assert!(bus.unlisten(Trail::ID.as_str(), "t.b"));
+    assert!(!bus.unlisten(Trail::ID.as_str(), "t.b"));
     assert!(bus.alter::<Trail>((), Vec::new()).value.is_empty());
     assert!(bus.collect::<Parts>(1).parts.is_empty());
 }
@@ -1123,7 +1167,7 @@ fn local_ordered_and_queued(make: Make) {
     let mine = seen.clone();
     bus.listen_local::<Trail>(
         "ui.panel",
-        ListenOpts::new().owner("ui").after("core"),
+        ListenOpts::new().owner("ui").after("t.core"),
         move |_, v| {
             mine.borrow_mut().push(v.clone());
             v.push("ui.panel".into());
@@ -1157,9 +1201,9 @@ fn local_ordered_and_queued(make: Make) {
     assert_eq!(ran[0].ran, ["ui.panel"]);
     assert_eq!(seen.borrow()[1], ["core", "tail"]);
     assert!(bus.run_pending().is_empty());
-    let infos = bus.listeners(Trail::ID).unwrap();
+    let infos = bus.listeners(Trail::ID.as_str()).unwrap();
     assert!(infos[1].local);
-    assert!(order_dump(&*bus, &[Trail::ID]).contains("ui.panel"));
+    assert!(order_dump(&*bus, &[Trail::ID.as_str()]).contains("ui.panel"));
     assert!(
         matches!(
             bus.listen_local::<Trail>("ui.slow", ListenOpts::new().threaded(), |_, _| Ok(())),
@@ -1218,7 +1262,7 @@ fn local_forget_from_any_thread(make: Make) {
         1,
         "its closure dropped on its thread"
     );
-    assert!(ids(&*bus, Trail::ID).is_empty());
+    assert!(ids(&*bus, Trail::ID.as_str()).is_empty());
 }
 
 fn local_deferred_collect_fresh(make: Make) {
@@ -1231,7 +1275,7 @@ fn local_deferred_collect_fresh(make: Make) {
         Ok(())
     })
     .unwrap();
-    bus.listen::<Parts>("disk", ListenOpts::new(), |n, out| {
+    bus.listen::<Parts>("t.disk", ListenOpts::new(), |n, out| {
         out.push(n + 1);
         Ok(())
     })
@@ -1240,7 +1284,7 @@ fn local_deferred_collect_fresh(make: Make) {
     let out = thread::spawn(move || other.collect::<Parts>(7))
         .join()
         .unwrap();
-    assert_eq!(out.parts, [("disk".to_string(), vec![8])]);
+    assert_eq!(out.parts, [("t.disk".to_string(), vec![8])]);
     assert_eq!(out.deferred, ["ui.badge"]);
     assert_eq!(bus.run_pending()[0].ran, ["ui.badge"]);
     assert_eq!(*got.borrow(), [vec![7]]);
@@ -1265,7 +1309,7 @@ fn local_refused_request_queues_nothing(make: Make) {
         },
     )
     .unwrap();
-    bus.listen::<Run>("gate", ListenOpts::new().after("ui.after"), |cmd, _| {
+    bus.listen::<Run>("t.gate", ListenOpts::new().after("ui.after"), |cmd, _| {
         if cmd == "format" {
             Err(HookError::refuse("never"))
         } else {
@@ -1277,7 +1321,7 @@ fn local_refused_request_queues_nothing(make: Make) {
     let out = thread::spawn(move || other.alter::<Run>("format".into(), vec![]))
         .join()
         .unwrap();
-    assert_eq!(out.refused.expect("refused").listener, "gate");
+    assert_eq!(out.refused.expect("refused").listener, "t.gate");
     assert!(out.deferred.is_empty(), "a refused request queues nothing");
     assert!(bus.run_pending().is_empty());
     let other = bus.clone();
@@ -1302,7 +1346,7 @@ fn local_refused_request_queues_nothing(make: Make) {
 fn deadline_inline_late_fails(make: Make) {
     let bus = make();
     bus.listen::<Trail>(
-        "slow",
+        "t.slow",
         ListenOpts::new().deadline(Duration::from_millis(5)),
         |_, v| {
             thread::sleep(Duration::from_millis(30));
@@ -1325,13 +1369,13 @@ fn deadline_threaded_abandoned(make: Make) {
     let bus = make();
     bus.declare::<Parts>(PointSpec::new("parts").deadline(Duration::from_millis(50)))
         .unwrap();
-    bus.listen::<Parts>("stuck", ListenOpts::new().threaded(), |_, out| {
+    bus.listen::<Parts>("t.stuck", ListenOpts::new().threaded(), |_, out| {
         thread::sleep(Duration::from_secs(3));
         out.push(0);
         Ok(())
     })
     .unwrap();
-    bus.listen::<Parts>("quick", ListenOpts::new().threaded(), |n, out| {
+    bus.listen::<Parts>("t.quick", ListenOpts::new().threaded(), |n, out| {
         out.push(*n);
         Ok(())
     })
@@ -1342,7 +1386,7 @@ fn deadline_threaded_abandoned(make: Make) {
         start.elapsed() < Duration::from_secs(2),
         "the emit waited for the deadline, not the stuck thread"
     );
-    assert_eq!(out.parts, [("quick".to_string(), vec![4])]);
+    assert_eq!(out.parts, [("t.quick".to_string(), vec![4])]);
     assert!(matches!(
         out.failures[0].kind,
         FailureKind::Late { took: None, .. }
@@ -1353,7 +1397,7 @@ fn deadline_threaded_abandoned(make: Make) {
     bus.declare::<Run>(PointSpec::new("runs").fail_closed())
         .unwrap();
     bus.listen::<Run>(
-        "policy",
+        "t.policy",
         ListenOpts::new()
             .threaded()
             .deadline(Duration::from_millis(20)),
@@ -1363,10 +1407,14 @@ fn deadline_threaded_abandoned(make: Make) {
         },
     )
     .unwrap();
-    bus.listen::<Run>("handler", ListenOpts::new().after("policy"), |_, did| {
-        did.push("ran".into());
-        Ok(())
-    })
+    bus.listen::<Run>(
+        "t.handler",
+        ListenOpts::new().after("t.policy"),
+        |_, did| {
+            did.push("ran".into());
+            Ok(())
+        },
+    )
     .unwrap();
     let out = bus.alter::<Run>("x".into(), vec![]);
     assert!(out.value.is_empty());
@@ -1381,47 +1429,98 @@ fn addr<T: ?Sized>(r: &T) -> *const () {
     r as *const T as *const ()
 }
 
-/// Whether the getter and the typed lookup give the same answer.
-fn same<C: ?Sized>(getter: Option<&C>, lookup: Option<&C>) -> bool {
-    match (getter, lookup) {
+/// Whether the extension trait and the typed lookup give the same answer.
+fn same<C: ?Sized>(extension: Option<&C>, lookup: Option<&C>) -> bool {
+    match (extension, lookup) {
         (None, None) => true,
         (Some(g), Some(l)) => addr(g) == addr(l),
         _ => false,
     }
 }
 
-fn capability_getter_and_lookup_agree(make: Make) {
-    use bus_contract::{Defer, Journal, Relay, Timings};
+fn capability_extension_and_lookup_agree(make: Make) {
+    use bus_contract_crossing::Relay;
+    use bus_contract_defer::Defer;
+    use bus_contract_journal::Journal;
+    use bus_contract_timings::Timings;
     let bus = make();
     assert!(
         same(bus.defer(), bus.get::<dyn Defer>()),
-        "defer(): the getter and the lookup disagree"
+        "defer(): the extension trait and the lookup disagree"
     );
     assert!(
         same(bus.timings(), bus.get::<dyn Timings>()),
-        "timings(): the getter and the lookup disagree"
+        "timings(): the extension trait and the lookup disagree"
     );
     assert!(
         same(bus.journal(), bus.get::<dyn Journal>()),
-        "journal(): the getter and the lookup disagree"
+        "journal(): the extension trait and the lookup disagree"
     );
     assert!(
         same(bus.relay(), bus.get::<dyn Relay>()),
-        "relay(): the getter and the lookup disagree"
+        "relay(): the extension trait and the lookup disagree"
     );
-    // `offers` answers from the getters: it sees what the lookup sees.
-    assert_eq!(
-        offers(&*bus, Capability::Defer),
-        bus.get::<dyn Defer>().is_some()
-    );
-    assert_eq!(
-        offers(&*bus, Capability::Timings),
-        bus.get::<dyn Timings>().is_some()
-    );
-    assert_eq!(
-        offers(&*bus, Capability::Journal),
-        bus.get::<dyn Journal>().is_some()
-    );
+    // `offers` asks the lookup: it sees what the lookup sees.
+    assert_eq!(offers(&*bus, DEFER), bus.get::<dyn Defer>().is_some());
+    assert_eq!(offers(&*bus, TIMINGS), bus.get::<dyn Timings>().is_some());
+    assert_eq!(offers(&*bus, JOURNAL), bus.get::<dyn Journal>().is_some());
+}
+
+// --- Ids ---
+
+/// Ids that break the naming rule: empty, one segment, an empty
+/// segment, a prefix not in `[a-z][a-z0-9_-]*`, a space.
+const BAD_IDS: &[&str] = &[
+    "", "single", ".lead", "trail.", "a..b", "Upper.x", "9lives.x", "a.b c",
+];
+
+fn id_declare_refuses_bad_ids(make: Make) {
+    let bus = make();
+    for &id in BAD_IDS {
+        assert!(
+            bus_contract::check_id(id).is_err(),
+            "`{id}` breaks the rule"
+        );
+        let key = PointKey {
+            id,
+            ..PointKey::of::<Trail>()
+        };
+        let refused = bus.declare_point(key, PointSpec::new("bad"));
+        assert!(
+            matches!(&refused, Err(Refused::BadId { id: got, .. }) if got == id),
+            "declaring `{id}` is refused with BadId: {refused:?}"
+        );
+        assert!(
+            bus.points().iter().all(|p| p.id != id),
+            "a refused point `{id}` is not declared"
+        );
+    }
+    // A good id still declares.
+    bus.declare::<Trail>(PointSpec::new("trail")).unwrap();
+}
+
+fn id_listen_refuses_bad_ids(make: Make) {
+    let bus = make();
+    let count = |bus: &dyn Bus| bus.listeners(Trail::ID.as_str()).map_or(0, |l| l.len());
+    for &id in BAD_IDS {
+        let refused = bus.listen::<Trail>(id, ListenOpts::new(), |_, _| Ok(()));
+        assert!(
+            matches!(&refused, Err(Refused::BadId { id: got, .. }) if got == id),
+            "listening as `{id}` is refused with BadId: {refused:?}"
+        );
+        let refused = bus.listen_local::<Trail>(id, ListenOpts::new(), |_, _| Ok(()));
+        assert!(
+            matches!(&refused, Err(Refused::BadId { id: got, .. }) if got == id),
+            "listening locally as `{id}` is refused with BadId: {refused:?}"
+        );
+        assert_eq!(count(&*bus), 0, "a refused listener `{id}` changes nothing");
+    }
+    // Targets are not checked: `LAST` and a bare name are accepted.
+    bus.listen::<Trail>("t.ok", ListenOpts::new().last(), |_, _| Ok(()))
+        .unwrap();
+    bus.listen::<Trail>("t.too", ListenOpts::new().after("bare"), |_, _| Ok(()))
+        .unwrap();
+    assert_eq!(count(&*bus), 2);
 }
 
 fn introspect_points_listeners_counters(make: Make) {
@@ -1429,8 +1528,11 @@ fn introspect_points_listeners_counters(make: Make) {
     bus.declare::<Parts>(PointSpec::new("Numbers, one list per listener"))
         .unwrap();
     bus.listen::<Parts>(
-        "flaky",
-        ListenOpts::new().owner("mod.a").before("other").priority(3),
+        "t.flaky",
+        ListenOpts::new()
+            .owner("mod.a")
+            .before("t.other")
+            .priority(3),
         |n, _| if *n == 0 { Err("zero".into()) } else { Ok(()) },
     )
     .unwrap();
@@ -1438,19 +1540,25 @@ fn introspect_points_listeners_counters(make: Make) {
     bus.collect::<Parts>(1);
     bus.collect::<Parts>(0);
     let points = bus.points();
-    let parts = points.iter().find(|p| p.id == Parts::ID).expect("parts");
+    let parts = points
+        .iter()
+        .find(|p| p.id == Parts::ID.as_str())
+        .expect("parts");
     assert!(parts.declared);
     assert_eq!(parts.kind, Parts::KIND);
     assert_eq!(parts.description, "Numbers, one list per listener");
     let flaky = &parts.listeners[0];
-    assert_eq!(flaky.id, "flaky");
+    assert_eq!(flaky.id, "t.flaky");
     assert_eq!(flaky.owner.as_deref(), Some("mod.a"));
-    assert_eq!(flaky.before, ["other"]);
+    assert_eq!(flaky.before, ["t.other"]);
     assert_eq!(flaky.priority, 3);
-    assert_eq!(flaky.missing, ["other"]);
+    assert_eq!(flaky.missing, ["t.other"]);
     assert_eq!((flaky.runs, flaky.failures), (2, 1));
     assert!(flaky.last_failure.as_deref().unwrap_or("").contains("zero"));
-    let trail = points.iter().find(|p| p.id == Trail::ID).expect("trail");
+    let trail = points
+        .iter()
+        .find(|p| p.id == Trail::ID.as_str())
+        .expect("trail");
     assert!(!trail.declared, "listened to, never declared");
     assert!(bus.listeners("nobody").is_none());
 }
@@ -1463,7 +1571,7 @@ fn defer_drain_in_ask_order(make: Make) {
     let heard: Arc<Mutex<Vec<String>>> = Arc::default();
     let h = heard.clone();
     let again = Arc::downgrade(&bus);
-    bus.listen::<Run>("persist", ListenOpts::new(), move |what, did| {
+    bus.listen::<Run>("t.persist", ListenOpts::new(), move |what, did| {
         match what.as_str() {
             "locked" => return Err(HookError::refuse("read-only")),
             "broken" => return Err("disk full".into()),
@@ -1492,7 +1600,7 @@ fn defer_drain_in_ask_order(make: Make) {
     let ran = defer.drain();
     assert_eq!(ran.len(), 3);
     assert_eq!(ran[0].ask, Some(first));
-    assert_eq!(ran[0].ran, ["persist"]);
+    assert_eq!(ran[0].ran, ["t.persist"]);
     assert_eq!(
         ran[1].refused.as_ref().expect("refused").reason,
         "read-only"
@@ -1512,7 +1620,7 @@ fn defer_asks_per_thread(make: Make) {
     let bus = make();
     let heard: Arc<Mutex<Vec<String>>> = Arc::default();
     let h = heard.clone();
-    bus.listen::<Run>("persist", ListenOpts::new(), move |what, _| {
+    bus.listen::<Run>("t.persist", ListenOpts::new(), move |what, _| {
         h.lock().unwrap().push(what.clone());
         Ok(())
     })
@@ -1537,7 +1645,7 @@ fn defer_asks_per_thread(make: Make) {
 // --- Timings ---
 
 fn sleeper(bus: &dyn Bus, id: &'static str, ms: u32) {
-    bus.listen::<Trail>(id, ListenOpts::new().owner("test"), move |_, v| {
+    bus.listen::<Trail>(lid(id), ListenOpts::new().owner("test"), move |_, v| {
         thread::sleep(MS * ms);
         v.push(id.to_owned());
         Ok(())
@@ -1553,22 +1661,34 @@ fn timings_timed_until_reset(make: Make) {
     for _ in 0..3 {
         bus.alter::<Trail>((), Vec::new());
     }
-    let t = timings.point(Trail::ID).expect("timed");
+    let t = timings.point(Trail::ID.as_str()).expect("timed");
     assert_eq!(t.passes.count, 3);
     assert!(t.passes.total >= MS * 12);
     assert!(t.passes.max >= MS * 4);
     let ids: Vec<&str> = t.listeners.iter().map(|l| l.id.as_str()).collect();
-    assert_eq!(ids, ["slow", "quick"], "in the order they run");
+    assert_eq!(ids, ["t.slow", "t.quick"], "in the order they run");
     assert_eq!(t.listeners[0].stats.count, 3);
-    assert_eq!(t.slowest()[0].id, "slow");
-    assert!(timings.points().iter().any(|p| p.point == Trail::ID));
+    assert_eq!(t.slowest()[0].id, "t.slow");
+    assert!(
+        timings
+            .points()
+            .iter()
+            .any(|p| p.point == Trail::ID.as_str())
+    );
     timings.reset();
     assert!(
-        timings.point(Trail::ID).is_none(),
+        timings.point(Trail::ID.as_str()).is_none(),
         "nothing since the reset"
     );
     bus.alter::<Trail>((), Vec::new());
-    assert_eq!(timings.point(Trail::ID).expect("timed").passes.count, 1);
+    assert_eq!(
+        timings
+            .point(Trail::ID.as_str())
+            .expect("timed")
+            .passes
+            .count,
+        1
+    );
 }
 
 fn timings_over_budget_reported(make: Make) {
@@ -1587,26 +1707,35 @@ fn timings_over_budget_reported(make: Make) {
     assert_eq!(out.value, ["quick", "slow"], "results kept");
     let heard = heard.lock().unwrap();
     assert_eq!(heard.len(), 1);
-    assert_eq!(heard[0].point, Trail::ID);
+    assert_eq!(heard[0].point, Trail::ID.as_str());
     assert_eq!(heard[0].budget, MS);
     assert!(heard[0].took >= MS * 5);
-    assert_eq!(timings.point(Trail::ID).expect("timed").over_budget, 1);
+    assert_eq!(
+        timings
+            .point(Trail::ID.as_str())
+            .expect("timed")
+            .over_budget,
+        1
+    );
 }
 
 // --- Journal and relay ---
 
-const JOURNALED: &[PointDecl] = &[
-    PointDecl::of::<Step>("A step.").journaled(),
+const JOURNALED_TABLE: &[PointDecl] = &[
+    PointDecl::of::<Step>("A step.").facets(&[JOURNALED]),
     PointDecl::of::<Plain>("Not journaled."),
 ];
 
 fn journal_refuses_off_journaled(make: Make) {
     let bus = make();
-    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    assert!(declare_all(&*bus, JOURNALED_TABLE).is_empty());
     assert!(
         matches!(
-            bus.declare::<Run>(PointSpec::new("runs").journaled()),
-            Err(Refused::NotEvent { .. })
+            bus.declare::<Run>(PointSpec::new("runs").facet(JOURNALED)),
+            Err(Refused::Contract {
+                contract: "journal",
+                ..
+            })
         ),
         "only an event point is journaled"
     );
@@ -1614,28 +1743,37 @@ fn journal_refuses_off_journaled(make: Make) {
     let before = journal.last_seq();
     assert!(matches!(
         journal.publish::<Plain>("x".into()),
-        Err(Refused::NotJournaled { .. })
+        Err(Refused::Contract {
+            contract: "journal",
+            ..
+        })
     ));
     assert!(matches!(
         journal.publish::<Run>("x".into()),
-        Err(Refused::NotJournaled { .. })
+        Err(Refused::Contract {
+            contract: "journal",
+            ..
+        })
     ));
     assert_eq!(journal.last_seq(), before, "nothing recorded");
     let shown: Vec<_> = bus
         .points()
         .iter()
-        .filter(|p| p.id == Step::ID || p.id == Plain::ID)
-        .map(|p| (p.id, p.journaled))
+        .filter(|p| p.id == Step::ID.as_str() || p.id == Plain::ID.as_str())
+        .map(|p| (p.id, bus_contract_journal::is_journaled(&p.facets)))
         .collect();
-    assert_eq!(shown, [(Plain::ID, false), (Step::ID, true)]);
+    assert_eq!(
+        shown,
+        [(Plain::ID.as_str(), false), (Step::ID.as_str(), true)]
+    );
 }
 
 fn journal_delivered(make: Make) {
     let bus = make();
-    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    assert!(declare_all(&*bus, JOURNALED_TABLE).is_empty());
     let heard: Arc<Mutex<Vec<(u32, thread::ThreadId)>>> = Arc::default();
     let h = heard.clone();
-    bus.listen::<Step>("steps", ListenOpts::new(), move |n, _| {
+    bus.listen::<Step>("t.steps", ListenOpts::new(), move |n, _| {
         h.lock().unwrap().push((*n, thread::current().id()));
         Ok(())
     })
@@ -1666,13 +1804,11 @@ fn journal_delivered(make: Make) {
 
 fn relay_resume_and_ingest(make: Make) {
     let bus = make();
-    let table = [PointDecl::of::<Shared>("Shared.").relayable(Codec::of::<Shared>())];
+    let table = [PointDecl::of::<Shared>("Shared.").facets(SHARED_RELAYABLE)];
     assert!(declare_all(&*bus, &table).is_empty());
-    assert!(
-        bus.points()
-            .iter()
-            .any(|p| p.id == Shared::ID && p.relayable && p.journaled)
-    );
+    assert!(bus.points().iter().any(|p| p.id == Shared::ID.as_str()
+        && bus_contract_crossing::codec(&p.facets).is_some()
+        && bus_contract_journal::is_journaled(&p.facets)));
     let journal = bus.journal().expect("journal");
     let relay = bus.relay().expect("relay");
     let from = relay.cursor();
@@ -1681,7 +1817,7 @@ fn relay_resume_and_ingest(make: Make) {
     assert!(journal.flush(WAIT));
     let read = relay.resume(from, 1);
     assert_eq!(read.entries.len(), 1, "in pages");
-    assert_eq!(read.entries[0].kind, Shared::ID);
+    assert_eq!(read.entries[0].kind, Shared::ID.as_str());
     assert_eq!(read.entries[0].text, "41");
     let rest = relay.resume(read.next, 10);
     let texts: Vec<_> = rest.entries.iter().map(|e| e.text.as_str()).collect();
@@ -1691,24 +1827,27 @@ fn relay_resume_and_ingest(make: Make) {
 
     let peer = Origin::process("peer");
     assert!(matches!(
-        relay.ingest(&peer, RelayedEntry::new(1, Shared::ID, "not a number")),
+        relay.ingest(
+            &peer,
+            RelayedEntry::new(1, Shared::ID.as_str(), "not a number")
+        ),
         Err(IngestError::Decode { .. })
     ));
     bus.declare::<Plain>(PointSpec::new("Not relayable."))
         .unwrap();
     assert!(matches!(
-        relay.ingest(&peer, RelayedEntry::new(2, Plain::ID, "x")),
+        relay.ingest(&peer, RelayedEntry::new(2, Plain::ID.as_str(), "x")),
         Err(IngestError::NotRelayable { .. })
     ));
     let heard: Arc<Mutex<Vec<u32>>> = Arc::default();
     let h = heard.clone();
-    bus.listen::<Shared>("shared", ListenOpts::new(), move |n, _| {
+    bus.listen::<Shared>("t.shared", ListenOpts::new(), move |n, _| {
         h.lock().unwrap().push(*n);
         Ok(())
     })
     .unwrap();
     let seq = relay
-        .ingest(&peer, RelayedEntry::new(3, Shared::ID, "7"))
+        .ingest(&peer, RelayedEntry::new(3, Shared::ID.as_str(), "7"))
         .expect("ingested");
     assert!(journal.flush(WAIT));
     assert_eq!(*heard.lock().unwrap(), [7], "taken in as a local entry");
@@ -1722,7 +1861,7 @@ fn relay_resume_and_ingest(make: Make) {
 /// did.
 struct Delete;
 impl Point for Delete {
-    const ID: &'static str = "conformance.delete";
+    const ID: PointId = PointId::new("conformance.delete");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -1757,7 +1896,7 @@ impl RelayedRequest for Delete {
 /// An alter point: it never crosses.
 struct Title;
 impl Point for Title {
-    const ID: &'static str = "conformance.title";
+    const ID: PointId = PointId::new("conformance.title");
     type Input = ();
     type Value = String;
 }
@@ -1774,13 +1913,22 @@ impl Relayed for Title {
 /// Wide: an ask meant to be answered in time, on a loaded machine too.
 const ASK: Duration = Duration::from_secs(5);
 
+const SHARED_CODEC: Codec = Codec::of::<Shared>();
+const SHARED_RELAYABLE: &[Facet] = &[relayable(&SHARED_CODEC)];
+const DELETE_CODEC: Codec = Codec::request::<Delete>();
+const DELETE_RELAYABLE: &[Facet] = &[relayable(&DELETE_CODEC)];
+const TITLE_CODEC: Codec = Codec::of::<Title>();
+const TITLE_RELAYABLE: &[Facet] = &[relayable(&TITLE_CODEC)];
+const DELETE_EVENT_CODEC: Codec = Codec::of::<Delete>();
+const DELETE_NO_VALUE: &[Facet] = &[relayable(&DELETE_EVENT_CODEC)];
+
 fn crossing_table(version: u32) -> [PointDecl; 2] {
     [
         PointDecl::of::<Shared>("Shared.")
-            .relayable(Codec::of::<Shared>())
+            .facets(SHARED_RELAYABLE)
             .version(version),
         PointDecl::of::<Delete>("Deletes.")
-            .relayable(Codec::request::<Delete>())
+            .facets(DELETE_RELAYABLE)
             .version(version),
     ]
 }
@@ -1840,29 +1988,44 @@ fn crossing_declared(make: Make) {
     let info = bus
         .points()
         .into_iter()
-        .find(|p| p.id == Delete::ID)
+        .find(|p| p.id == Delete::ID.as_str())
         .expect("declared");
-    assert!(info.relayable, "a request crosses");
+    assert!(
+        bus_contract_crossing::codec(&info.facets).is_some(),
+        "a request crosses"
+    );
     assert!(info.fail_closed, "a relayable request is fail-closed");
-    assert!(!info.journaled, "a request is not journaled");
+    assert!(
+        !bus_contract_journal::is_journaled(&info.facets),
+        "a request is not journaled"
+    );
     assert_eq!(info.version, 3);
 
     let bus = make();
     let table = [
-        PointDecl::of::<Title>("A title.").relayable(Codec::of::<Title>()),
-        PointDecl::of::<Delete>("No value codec.").relayable(Codec::of::<Delete>()),
+        PointDecl::of::<Title>("A title.").facets(TITLE_RELAYABLE),
+        PointDecl::of::<Delete>("No value codec.").facets(DELETE_NO_VALUE),
     ];
-    assert_eq!(
-        declare_all(&*bus, &table),
-        [
-            Refused::NotCrossable { point: Title::ID },
-            Refused::NotCrossable { point: Delete::ID },
-        ]
+    let refused = declare_all(&*bus, &table);
+    assert!(
+        matches!(
+            &refused[..],
+            [
+                Refused::Contract { point: a, contract: "crossing", .. },
+                Refused::Contract { point: b, contract: "crossing", .. },
+            ] if *a == Title::ID.as_str() && *b == Delete::ID.as_str()
+        ),
+        "a request with no value codec cannot cross: {refused:?}"
     );
     assert!(bus.points().iter().all(|p| !p.declared), "nothing declared");
-    assert_eq!(
-        bus.declare::<Title>(PointSpec::new("A title.").relayable_request(Codec::of::<Title>())),
-        Err(Refused::NotCrossable { point: Title::ID }),
+    assert!(
+        matches!(
+            bus.declare::<Title>(PointSpec::new("A title.").facet(relayable(&TITLE_CODEC))),
+            Err(Refused::Contract {
+                contract: "crossing",
+                ..
+            })
+        ),
         "declared one by one too"
     );
 }
@@ -1948,7 +2111,7 @@ fn crossing_far_deadline(make: Make) {
     let far = crossing_bus(make, 1);
     let ran = far_deletes(&far);
     let relay = far.relay().unwrap();
-    let late = ask(1, 1, Delete::ID, Duration::ZERO, "/a");
+    let late = ask(1, 1, Delete::ID.as_str(), Duration::ZERO, "/a");
     thread::sleep(MS);
     match relay.answer(&asker(), late).answer {
         Answer::Refused { listener: None, .. } => {}
@@ -1963,7 +2126,7 @@ fn crossing_far_deadline(make: Make) {
         Ok(())
     })
     .unwrap();
-    let slow = ask(1, 2, Delete::ID, Duration::from_millis(10), "/b");
+    let slow = ask(1, 2, Delete::ID.as_str(), Duration::from_millis(10), "/b");
     match relay.answer(&asker(), slow).answer {
         Answer::Refused { failed: true, .. } => {}
         other => panic!("listeners ended past the deadline: {other:?}"),
@@ -1974,7 +2137,7 @@ fn crossing_answered_once(make: Make) {
     let far = crossing_bus(make, 1);
     let ran = far_deletes(&far);
     let relay = far.relay().unwrap();
-    let first_ask = ask(7, 1, Delete::ID, ASK, "/a");
+    let first_ask = ask(7, 1, Delete::ID.as_str(), ASK, "/a");
     let first = relay.answer(&asker(), first_ask.clone());
     let again = relay.answer(&asker(), first_ask.clone());
     assert_eq!(first, again, "a repeat gets the first answer");
@@ -1999,7 +2162,7 @@ fn crossing_not_relayable_refused(make: Make) {
     let far = crossing_bus(make, 1);
     far.declare::<Run>(PointSpec::new("Local only.")).unwrap();
     let relay = far.relay().unwrap();
-    for (n, kind) in ["conformance.unknown", Run::ID, Shared::ID]
+    for (n, kind) in ["conformance.unknown", Run::ID.as_str(), Shared::ID.as_str()]
         .into_iter()
         .enumerate()
     {
@@ -2012,7 +2175,7 @@ fn crossing_not_relayable_refused(make: Make) {
         }
     }
     // An input or a value it cannot read.
-    let mut odd = ask(1, 10, Delete::ID, ASK, "/a");
+    let mut odd = ask(1, 10, Delete::ID.as_str(), ASK, "/a");
     odd.value = "a|b".into();
     assert!(matches!(
         relay.answer(&asker(), odd).answer,
@@ -2020,9 +2183,9 @@ fn crossing_not_relayable_refused(make: Make) {
     ));
     // A request is asked, not ingested.
     assert_eq!(
-        relay.ingest(&asker(), RelayedEntry::new(1, Delete::ID, "/a")),
+        relay.ingest(&asker(), RelayedEntry::new(1, Delete::ID.as_str(), "/a")),
         Err(IngestError::NotRelayable {
-            kind: Delete::ID.into()
+            kind: Delete::ID.as_str().into()
         })
     );
 }
@@ -2034,7 +2197,7 @@ fn crossing_origin_kept(make: Make) {
     let seq = bus
         .relay()
         .unwrap()
-        .ingest(&from, RelayedEntry::new(1, Shared::ID, "5"))
+        .ingest(&from, RelayedEntry::new(1, Shared::ID.as_str(), "5"))
         .unwrap();
     let unknown = bus
         .relay()
@@ -2071,20 +2234,20 @@ fn crossing_authority_asks(make: Make) {
         Ok(())
     });
     relay.authorize(|c| match &c.origin.agent {
-        Some(agent) if c.kind == Delete::ID => Err(format!("{agent} may not delete")),
+        Some(agent) if c.kind == Delete::ID.as_str() => Err(format!("{agent} may not delete")),
         _ => Ok(()),
     });
     let agent = asker().agent("claude");
     assert_eq!(
         relay
-            .answer(&agent, ask(1, 1, Delete::ID, ASK, "/a"))
+            .answer(&agent, ask(1, 1, Delete::ID.as_str(), ASK, "/a"))
             .answer,
         Answer::refused("claude may not delete")
     );
     assert!(ran.lock().unwrap().is_empty(), "nothing ran");
     // Checked before anything is read: an unreadable ask is refused by
     // the authority, not the codec.
-    let mut odd = ask(1, 2, Delete::ID, ASK, "/a");
+    let mut odd = ask(1, 2, Delete::ID.as_str(), ASK, "/a");
     odd.value = "a|b".into();
     assert_eq!(
         relay.answer(&agent, odd).answer,
@@ -2093,7 +2256,7 @@ fn crossing_authority_asks(make: Make) {
     // The process itself is let through.
     assert!(matches!(
         relay
-            .answer(&asker(), ask(1, 3, Delete::ID, ASK, "/a"))
+            .answer(&asker(), ask(1, 3, Delete::ID.as_str(), ASK, "/a"))
             .answer,
         Answer::Done { .. }
     ));
@@ -2101,7 +2264,12 @@ fn crossing_authority_asks(make: Make) {
     assert_eq!(seen.len(), 3, "every ask shown, in order");
     assert_eq!(
         seen[0],
-        ("asker (agent claude)".into(), Delete::ID.into(), 1, true)
+        (
+            "asker (agent claude)".into(),
+            Delete::ID.as_str().into(),
+            1,
+            true
+        )
     );
 }
 
@@ -2111,7 +2279,7 @@ fn crossing_authority_events(make: Make) {
     let relay = bus.relay().unwrap();
     let heard: Arc<Mutex<Vec<u32>>> = Arc::default();
     let h = heard.clone();
-    bus.listen::<Shared>("shared", ListenOpts::new(), move |n, _| {
+    bus.listen::<Shared>("t.shared", ListenOpts::new(), move |n, _| {
         h.lock().unwrap().push(*n);
         Ok(())
     })
@@ -2129,14 +2297,14 @@ fn crossing_authority_events(make: Make) {
         let err = relay
             .ingest(
                 &Origin::process(from),
-                RelayedEntry::new(1, Shared::ID, "not even a number"),
+                RelayedEntry::new(1, Shared::ID.as_str(), "not even a number"),
             )
             .unwrap_err();
         assert!(matches!(err, IngestError::Refused { .. }), "{from}: {err}");
     }
     assert_eq!(journal.last_seq(), before, "nothing recorded");
     relay
-        .ingest(&asker(), RelayedEntry::new(2, Shared::ID, "9"))
+        .ingest(&asker(), RelayedEntry::new(2, Shared::ID.as_str(), "9"))
         .expect("let through");
     assert!(journal.flush(WAIT));
     assert_eq!(*heard.lock().unwrap(), [9], "only what was let through");
@@ -2153,9 +2321,9 @@ fn crossing_same_version(make: Make) {
     let relay = far.relay().unwrap();
     let before = far.journal().unwrap().last_seq();
     assert_eq!(
-        relay.ingest(&asker(), RelayedEntry::new(1, Shared::ID, "1")),
+        relay.ingest(&asker(), RelayedEntry::new(1, Shared::ID.as_str(), "1")),
         Err(IngestError::Version {
-            kind: Shared::ID.into(),
+            kind: Shared::ID.as_str().into(),
             sent: 1,
             here: 2
         })
@@ -2184,19 +2352,19 @@ fn listen_on_the_emitting_point(make: Make) {
     push(&*bus, "doomed", ListenOpts::new());
     let inner = Arc::downgrade(&bus);
     bus.listen::<Trail>(
-        "changer",
-        ListenOpts::new().before("doomed"),
+        "t.changer",
+        ListenOpts::new().before("t.doomed"),
         move |_, v| {
             let bus = inner.upgrade().expect("the bus is alive");
-            let known = bus.listeners(Trail::ID).unwrap_or_default();
-            if !known.iter().any(|l| l.id == "late") {
-                bus.listen::<Trail>("late", ListenOpts::new(), |_, v| {
+            let known = bus.listeners(Trail::ID.as_str()).unwrap_or_default();
+            if !known.iter().any(|l| l.id == "t.late") {
+                bus.listen::<Trail>("t.late", ListenOpts::new(), |_, v| {
                     v.push("late".into());
                     Ok(())
                 })
                 .map_err(|e| HookError::from(e.to_string()))?;
             }
-            bus.unlisten(Trail::ID, "doomed");
+            bus.unlisten(Trail::ID.as_str(), "t.doomed");
             v.push("changer".into());
             Ok(())
         },
@@ -2233,22 +2401,26 @@ fn refusal_keeps_earlier_effects(make: Make) {
         }
         let effects = Arc::new(Mutex::new(0));
         let e = effects.clone();
-        bus.listen::<Run>("first", ListenOpts::new(), move |_, did| {
+        bus.listen::<Run>("t.first", ListenOpts::new(), move |_, did| {
             *e.lock().unwrap() += 1;
             did.push("first".into());
             Ok(())
         })
         .unwrap();
-        bus.listen::<Run>("stop", ListenOpts::new().after("first"), move |_, did| {
-            did.push("stop".into());
-            if fail_closed {
-                Err("broken".into())
-            } else {
-                Err(HookError::refuse("no"))
-            }
-        })
+        bus.listen::<Run>(
+            "t.stop",
+            ListenOpts::new().after("t.first"),
+            move |_, did| {
+                did.push("stop".into());
+                if fail_closed {
+                    Err("broken".into())
+                } else {
+                    Err(HookError::refuse("no"))
+                }
+            },
+        )
         .unwrap();
-        bus.listen::<Run>("never", ListenOpts::new().after("stop"), |_, did| {
+        bus.listen::<Run>("t.never", ListenOpts::new().after("t.stop"), |_, did| {
             did.push("never".into());
             Ok(())
         })
@@ -2303,7 +2475,7 @@ fn local_panicking_waker_ignored(make: Make) {
     let woken = Arc::new(Mutex::new(Vec::new()));
     let w = woken.clone();
     bus.on_pending(move |t| w.lock().unwrap().push(t));
-    bus.listen_local::<Trail>("ui", ListenOpts::new(), |_, v| {
+    bus.listen_local::<Trail>("t.ui", ListenOpts::new(), |_, v| {
         v.push("ui".into());
         Ok(())
     })
@@ -2314,7 +2486,7 @@ fn local_panicking_waker_ignored(make: Make) {
         .join()
         .expect("a panicking waker does not reach the emitter");
     assert_eq!(out.value, ["core"]);
-    assert_eq!(out.deferred, ["ui"]);
+    assert_eq!(out.deferred, ["t.ui"]);
     assert_eq!(
         *woken.lock().unwrap(),
         [thread::current().id()],
@@ -2322,13 +2494,13 @@ fn local_panicking_waker_ignored(make: Make) {
     );
     let ran = bus.run_pending();
     assert_eq!(ran.len(), 1);
-    assert_eq!(ran[0].ran, ["ui"]);
+    assert_eq!(ran[0].ran, ["t.ui"]);
 }
 
 // --- Defer: checks for the guarantees page's open rows ---
 
 fn run_listener(bus: &dyn Bus, id: &'static str) {
-    bus.listen::<Run>(id, ListenOpts::new(), move |_, did| {
+    bus.listen::<Run>(lid(id), ListenOpts::new(), move |_, did| {
         did.push(id.into());
         Ok(())
     })
@@ -2356,7 +2528,7 @@ fn defer_ask_wakes_its_thread(make: Make) {
         "an ask calls the wakers with its thread's id"
     );
     assert_eq!(drained.len(), 1);
-    assert_eq!(drained[0].ran, ["persist"]);
+    assert_eq!(drained[0].ran, ["t.persist"]);
 }
 
 fn defer_listeners_read_at_the_drain(make: Make) {
@@ -2365,13 +2537,13 @@ fn defer_listeners_read_at_the_drain(make: Make) {
     run_listener(&*bus, "kept");
     let defer = bus.defer().expect("defer");
     defer.ask::<Run>("x".into(), vec![]);
-    assert!(bus.unlisten(Run::ID, "gone"));
+    assert!(bus.unlisten(Run::ID.as_str(), "t.gone"));
     run_listener(&*bus, "added");
     let ran = defer.drain();
     assert_eq!(ran.len(), 1);
     assert_eq!(
         ran[0].ran,
-        ["kept", "added"],
+        ["t.kept", "t.added"],
         "a listener removed after the ask does not run, one added does"
     );
 }
@@ -2383,7 +2555,7 @@ fn timings_threaded_late_counts_the_wait(make: Make) {
     let timings = bus.timings().expect("timings");
     let deadline = MS * 30;
     bus.listen::<Parts>(
-        "stuck",
+        "t.stuck",
         ListenOpts::new().threaded().deadline(deadline),
         |_, _| {
             thread::sleep(Duration::from_secs(2));
@@ -2396,12 +2568,12 @@ fn timings_threaded_late_counts_the_wait(make: Make) {
         out.failures[0].kind,
         FailureKind::Late { took: None, .. }
     ));
-    let t = timings.point(Parts::ID).expect("timed");
+    let t = timings.point(Parts::ID.as_str()).expect("timed");
     assert_eq!(t.passes.count, 1);
     let stuck = t
         .listeners
         .iter()
-        .find(|l| l.id == "stuck")
+        .find(|l| l.id == "t.stuck")
         .expect("a listener that missed its deadline is timed");
     assert_eq!(stuck.stats.count, 1, "timed when the emit stopped waiting");
     assert!(
@@ -2420,7 +2592,7 @@ pub const WINDOW_PROBE: u32 = 1 << 14;
 
 /// Calls `publish` until the entry `seq` has left the window,
 /// up to [`WINDOW_PROBE`]; whether it left.
-fn push_out(journal: &dyn bus_contract::Journal, seq: u64, publish: impl Fn(u32)) -> bool {
+fn push_out(journal: &dyn bus_contract_journal::Journal, seq: u64, publish: impl Fn(u32)) -> bool {
     let kept = || journal.since(seq - 1, 1).entries.first().map(|e| e.seq) == Some(seq);
     let mut n = 0;
     while kept() {
@@ -2435,7 +2607,7 @@ fn push_out(journal: &dyn bus_contract::Journal, seq: u64, publish: impl Fn(u32)
 
 fn journal_numbers_grow_by_one(make: Make) {
     let bus = make();
-    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    assert!(declare_all(&*bus, JOURNALED_TABLE).is_empty());
     let journal = bus.journal().expect("journal");
     let before = journal.last_seq();
     let seqs: Vec<u64> = (0..5)
@@ -2448,7 +2620,7 @@ fn journal_numbers_grow_by_one(make: Make) {
 
 fn journal_since_reports_the_gap(make: Make) {
     let bus = make();
-    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    assert!(declare_all(&*bus, JOURNALED_TABLE).is_empty());
     let journal = bus.journal().expect("journal");
     let first = journal.publish::<Step>(0).expect("journaled");
     let read = journal.since(first - 1, 10);
@@ -2472,12 +2644,14 @@ fn journal_since_reports_the_gap(make: Make) {
 
 fn journal_wait_and_wait_for(make: Make) {
     let bus = make();
-    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    assert!(declare_all(&*bus, JOURNALED_TABLE).is_empty());
     let journal = bus.journal().expect("journal");
     let before = journal.last_seq();
     let seq = journal.publish::<Step>(7).expect("journaled");
     let start = Instant::now();
-    let got = journal.wait(&[Step::ID], before, WAIT).expect("there");
+    let got = journal
+        .wait(&[Step::ID.as_str()], before, WAIT)
+        .expect("there");
     assert!(
         start.elapsed() < WAIT / 2,
         "an entry already there is returned at once"
@@ -2508,7 +2682,7 @@ fn journal_wait_and_wait_for(make: Make) {
 
 fn journal_cause_kept(make: Make) {
     let bus = make();
-    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    assert!(declare_all(&*bus, JOURNALED_TABLE).is_empty());
     let journal = bus.journal().expect("journal");
     let cause = journal.publish::<Step>(1).expect("journaled");
     let caused = journal.publish_caused::<Step>(2, cause).expect("journaled");
@@ -2530,11 +2704,11 @@ fn crossing_relay_implies_journal(make: Make) {
     let bus = make();
     if bus.relay().is_some() {
         assert!(bus.journal().is_some(), "a bus with Relay offers Journal");
-        assert!(offers(&*bus, Capability::Relay));
+        assert!(offers(&*bus, RELAY));
     }
 }
 
-fn texts(read: &bus_contract::Resumed) -> Vec<&str> {
+fn texts(read: &Resumed) -> Vec<&str> {
     read.entries.iter().map(|e| e.text.as_str()).collect()
 }
 
@@ -2589,7 +2763,7 @@ fn crossing_ingested_not_echoed(make: Make) {
     let from = relay.cursor();
     let peer = Origin::process("peer");
     relay
-        .ingest(&peer, RelayedEntry::new(1, Shared::ID, "5"))
+        .ingest(&peer, RelayedEntry::new(1, Shared::ID.as_str(), "5"))
         .expect("ingested");
     relay
         .ingest(&peer, RelayedEntry::new(2, "elsewhere.happened", "x"))

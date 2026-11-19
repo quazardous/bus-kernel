@@ -16,10 +16,12 @@ use std::time::{Duration, Instant};
 
 use bus_kernel::bus_contract::{Bus, PointKey};
 use bus_kernel::{
-    Answer, Capability, Codec, Cursor, IngestError, Kernel, ListenOpts, Lost, Origin, Point,
-    PointDecl, PointKind, PointSpec, Refused, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry,
+    Answer, Codec, Cursor, IngestError, Kernel, ListenOpts, Lost, Origin, Point, PointDecl,
+    PointId, PointKind, PointSpec, Refused, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry,
     RelayedRequest, declare_all, offers,
 };
+#[allow(unused_imports)]
+use bus_kernel::{BusCrossing, BusDefer, BusJournal, BusTimings};
 use memory::{Memory, full, kernel};
 
 // --- The points of the tests ---
@@ -33,7 +35,7 @@ struct Imported {
 /// Photos were imported. Relayable.
 struct LibraryImported;
 impl Point for LibraryImported {
-    const ID: &'static str = "library.imported";
+    const ID: PointId = PointId::new("library.imported");
     const KIND: PointKind = PointKind::Event;
     type Input = Imported;
     type Value = ();
@@ -59,7 +61,7 @@ impl Relayed for LibraryImported {
 /// A journaled event kept in its process.
 struct StepComputed;
 impl Point for StepComputed {
-    const ID: &'static str = "engine.step";
+    const ID: PointId = PointId::new("engine.step");
     const KIND: PointKind = PointKind::Event;
     type Input = u32;
     type Value = ();
@@ -68,7 +70,7 @@ impl Point for StepComputed {
 /// An event emitted directly, not journaled.
 struct VolumeMounted;
 impl Point for VolumeMounted {
-    const ID: &'static str = "volume.mounted";
+    const ID: PointId = PointId::new("volume.mounted");
     const KIND: PointKind = PointKind::Event;
     type Input = String;
     type Value = ();
@@ -77,16 +79,17 @@ impl Point for VolumeMounted {
 /// A request: never journaled.
 struct DocClose;
 impl Point for DocClose {
-    const ID: &'static str = "doc.close";
+    const ID: PointId = PointId::new("doc.close");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
 }
 
 const POINTS: &[PointDecl] = &[
-    PointDecl::of::<LibraryImported>("Photos were imported.")
-        .relayable(Codec::of::<LibraryImported>()),
-    PointDecl::of::<StepComputed>("A render step was computed.").journaled(),
+    PointDecl::of::<LibraryImported>("Photos were imported.").facets(&[
+        bus_kernel::bus_contract_crossing::relayable_event::<LibraryImported>(),
+    ]),
+    PointDecl::of::<StepComputed>("A render step was computed.").facets(&[bus_kernel::JOURNALED]),
     PointDecl::of::<VolumeMounted>("A volume was mounted."),
 ];
 
@@ -104,29 +107,29 @@ const WAIT: Duration = Duration::from_secs(10);
 #[test]
 fn without_a_host_journal_journaled_and_relayable_points_are_refused() {
     let k = Kernel::new();
-    assert!(!offers(&k, Capability::Journal));
-    assert!(!offers(&k, Capability::Relay));
-    assert!(Bus::journal(&k).is_none());
-    assert!(Bus::relay(&k).is_none());
+    assert!(!offers(&k, &bus_kernel::bus_contract_journal::CONTRACT));
+    assert!(!offers(&k, &bus_kernel::bus_contract_crossing::CONTRACT));
+    assert!(BusJournal::journal(&k).is_none());
+    assert!(BusCrossing::relay(&k).is_none());
     assert_eq!(
         declare_all(&k, POINTS),
         [
             Refused::Unsupported {
                 point: "library.imported",
-                capability: Capability::Journal
+                contract: "crossing"
             },
             Refused::Unsupported {
                 point: "engine.step",
-                capability: Capability::Journal
+                contract: "journal"
             },
         ]
     );
     // Declared directly, past `declare_all`: refused the same.
     assert_eq!(
-        k.declare::<StepComputed>(PointSpec::new("Steps.").journaled()),
+        k.declare::<StepComputed>(PointSpec::new("Steps.").facet(bus_kernel::JOURNALED)),
         Err(Refused::Unsupported {
             point: "engine.step",
-            capability: Capability::Journal
+            contract: "journal"
         })
     );
     let ids: Vec<_> = k.points().iter().map(|p| p.id).collect();
@@ -137,29 +140,29 @@ fn without_a_host_journal_journaled_and_relayable_points_are_refused() {
 fn a_relay_without_a_journal_is_not_offered() {
     let host = Arc::new(Memory::new(Weak::new(), 16));
     let k = Kernel::new().with_relay(host);
-    assert!(!offers(&k, Capability::Relay));
-    assert!(Bus::relay(&k).is_none());
+    assert!(!offers(&k, &bus_kernel::bus_contract_crossing::CONTRACT));
+    assert!(BusCrossing::relay(&k).is_none());
 }
 
 #[test]
 fn a_journal_without_a_relay_refuses_relayable_points() {
     let k = kernel(false, 16);
-    assert!(offers(&*k, Capability::Journal));
-    assert!(!offers(&*k, Capability::Relay));
+    assert!(offers(&*k, &bus_kernel::bus_contract_journal::CONTRACT));
+    assert!(!offers(&*k, &bus_kernel::bus_contract_crossing::CONTRACT));
     assert_eq!(
         declare_all(&*k, POINTS),
         [Refused::Unsupported {
             point: "library.imported",
-            capability: Capability::Relay
+            contract: "crossing"
         }]
     );
     assert_eq!(
-        k.declare::<LibraryImported>(
-            PointSpec::new("Imports.").relayable(Codec::of::<LibraryImported>())
-        ),
+        k.declare::<LibraryImported>(PointSpec::new("Imports.").facet(
+            bus_kernel::bus_contract_crossing::relayable_event::<LibraryImported>()
+        )),
         Err(Refused::Unsupported {
             point: "library.imported",
-            capability: Capability::Relay
+            contract: "crossing"
         })
     );
 }
@@ -167,17 +170,23 @@ fn a_journal_without_a_relay_refuses_relayable_points() {
 #[test]
 fn only_an_event_point_is_journaled_and_a_codec_fits_its_point() {
     let k = full();
-    assert!(offers(&*k, Capability::Relay));
+    assert!(offers(&*k, &bus_kernel::bus_contract_crossing::CONTRACT));
     assert_eq!(
-        k.declare::<DocClose>(PointSpec::new("Closes.").journaled()),
-        Err(Refused::NotEvent { point: "doc.close" })
+        k.declare::<DocClose>(PointSpec::new("Closes.").facet(bus_kernel::JOURNALED)),
+        Err(Refused::Contract {
+            point: "doc.close",
+            contract: "journal",
+            reason: "only an event point is journaled".into()
+        })
     );
     assert_eq!(
-        k.declare::<VolumeMounted>(
-            PointSpec::new("Volumes.").relayable(Codec::of::<LibraryImported>())
-        ),
-        Err(Refused::TypeMismatch {
-            point: "volume.mounted"
+        k.declare::<VolumeMounted>(PointSpec::new("Volumes.").facet(
+            bus_kernel::bus_contract_crossing::relayable_event::<LibraryImported>()
+        )),
+        Err(Refused::Contract {
+            point: "volume.mounted",
+            contract: "crossing",
+            reason: "the codec is another point's".into()
         })
     );
     assert!(k.points().is_empty());
@@ -190,7 +199,13 @@ fn introspection_and_the_declaration_show_journaled_and_relayable_points() {
     let shown: Vec<_> = k
         .points()
         .iter()
-        .map(|p| (p.id, p.journaled, p.relayable))
+        .map(|p| {
+            (
+                p.id,
+                bus_kernel::bus_contract_journal::is_journaled(&p.facets),
+                bus_kernel::bus_contract_crossing::codec(&p.facets).is_some(),
+            )
+        })
         .collect();
     assert_eq!(
         shown,
@@ -200,9 +215,12 @@ fn introspection_and_the_declaration_show_journaled_and_relayable_points() {
             ("volume.mounted", false, false),
         ]
     );
-    let (key, spec) = k.declaration(LibraryImported::ID).unwrap();
+    let (key, spec) = k.declaration(LibraryImported::ID.as_str()).unwrap();
     assert_eq!(key, PointKey::of::<LibraryImported>());
-    assert_eq!(spec.relay, Some(Codec::of::<LibraryImported>()));
+    assert_eq!(
+        bus_kernel::bus_contract_crossing::codec(&spec.facets),
+        Some(&Codec::of::<LibraryImported>())
+    );
     assert!(k.declaration("nobody").is_none());
     assert!(format!("{k:?}").contains("journal: true"));
 }
@@ -221,7 +239,7 @@ fn entries_are_delivered_once_in_order_off_the_publishers_thread() {
     })
     .unwrap();
 
-    let journal = Bus::journal(&*k).unwrap();
+    let journal = BusJournal::journal(&*k).unwrap();
     assert_eq!(journal.last_seq(), 0);
     let seqs: Vec<u64> = (0..5)
         .map(|n| journal.publish::<StepComputed>(n).unwrap())
@@ -251,7 +269,7 @@ fn a_local_listener_hears_entries_at_its_threads_run_pending_in_order() {
         Ok(())
     })
     .unwrap();
-    let journal = Bus::journal(&*k).unwrap();
+    let journal = BusJournal::journal(&*k).unwrap();
     for n in 0..4 {
         journal.publish::<StepComputed>(n).unwrap();
     }
@@ -268,12 +286,12 @@ fn a_local_listener_hears_entries_at_its_threads_run_pending_in_order() {
 fn a_slow_listener_delays_the_next_entries_not_the_publisher() {
     let k = full();
     assert!(declare_all(&*k, POINTS).is_empty());
-    k.listen::<StepComputed>("slow", ListenOpts::new(), |_, _| {
+    k.listen::<StepComputed>("t.slow", ListenOpts::new(), |_, _| {
         thread::sleep(Duration::from_millis(200));
         Ok(())
     })
     .unwrap();
-    let journal = Bus::journal(&*k).unwrap();
+    let journal = BusJournal::journal(&*k).unwrap();
     let start = Instant::now();
     for n in 0..3 {
         journal.publish::<StepComputed>(n).unwrap();
@@ -291,16 +309,16 @@ fn a_slow_listener_delays_the_next_entries_not_the_publisher() {
 fn the_kernel_refuses_a_publish_on_a_point_not_journaled() {
     let k = full();
     assert!(declare_all(&*k, POINTS).is_empty());
-    let journal = Bus::journal(&*k).unwrap();
+    let journal = BusJournal::journal(&*k).unwrap();
     assert_eq!(
         journal.publish::<VolumeMounted>("/mnt".into()),
-        Err(Refused::NotJournaled {
-            point: "volume.mounted"
-        })
+        Err(bus_kernel::bus_contract_journal::not_journaled(
+            "volume.mounted"
+        ))
     );
     assert_eq!(
         journal.publish::<DocClose>("a".into()),
-        Err(Refused::NotJournaled { point: "doc.close" })
+        Err(bus_kernel::bus_contract_journal::not_journaled("doc.close"))
     );
     // Nothing reached the host.
     assert_eq!(journal.last_seq(), 0);
@@ -333,13 +351,13 @@ fn node_and_desktop() -> (Arc<Kernel>, Arc<Kernel>, Heard) {
 #[test]
 fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
     let (node, desktop, heard) = node_and_desktop();
-    let nj = Bus::journal(&*node).unwrap();
+    let nj = BusJournal::journal(&*node).unwrap();
     let a = nj.publish::<LibraryImported>(imported("/a", 1)).unwrap();
     nj.publish::<StepComputed>(7).unwrap(); // journaled, not relayable
     nj.publish_caused::<LibraryImported>(imported("/b", 2), a)
         .unwrap();
 
-    let relay = Bus::relay(&*node).unwrap();
+    let relay = BusCrossing::relay(&*node).unwrap();
     let read = relay.resume(Cursor::START, 100);
     assert_eq!(read.lost, None);
     let kinds: Vec<(u64, &str, &str)> = read
@@ -358,12 +376,12 @@ fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
     assert_eq!(read.next, relay.cursor());
 
     for e in read.entries {
-        Bus::relay(&*desktop)
+        BusCrossing::relay(&*desktop)
             .unwrap()
             .ingest(&node_origin(), e)
             .unwrap();
     }
-    let dj = Bus::journal(&*desktop).unwrap();
+    let dj = BusJournal::journal(&*desktop).unwrap();
     assert!(dj.flush(WAIT));
     assert_eq!(
         *heard.lock().unwrap(),
@@ -374,7 +392,7 @@ fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
     assert_eq!(kept.entries[1].cause, Some(1));
     // Taken in, not served again.
     assert!(
-        Bus::relay(&*desktop)
+        BusCrossing::relay(&*desktop)
             .unwrap()
             .resume(Cursor::START, 100)
             .entries
@@ -383,11 +401,13 @@ fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
     // A restarted node: another run.
     let restarted = full();
     assert!(declare_all(&*restarted, POINTS).is_empty());
-    Bus::journal(&*restarted)
+    BusJournal::journal(&*restarted)
         .unwrap()
         .publish::<LibraryImported>(imported("/new", 1))
         .unwrap();
-    let again = Bus::relay(&*restarted).unwrap().resume(read.next, 100);
+    let again = BusCrossing::relay(&*restarted)
+        .unwrap()
+        .resume(read.next, 100);
     assert_eq!(again.lost, Some(Lost::Restarted));
     assert_eq!(again.entries.len(), 1);
 }
@@ -395,7 +415,7 @@ fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
 #[test]
 fn ingest_refuses_what_it_cannot_read_or_may_not_take() {
     let (_, desktop, heard) = node_and_desktop();
-    let relay = Bus::relay(&*desktop).unwrap();
+    let relay = BusCrossing::relay(&*desktop).unwrap();
     relay
         .ingest(
             &node_origin(),
@@ -429,7 +449,7 @@ fn ingest_refuses_what_it_cannot_read_or_may_not_take() {
             .unwrap(),
         2
     );
-    let journal = Bus::journal(&*desktop).unwrap();
+    let journal = BusJournal::journal(&*desktop).unwrap();
     assert!(journal.flush(WAIT));
     assert_eq!(*heard.lock().unwrap(), [imported("/a", 4)]);
 }
@@ -438,7 +458,7 @@ fn ingest_refuses_what_it_cannot_read_or_may_not_take() {
 
 struct Delete;
 impl Point for Delete {
-    const ID: &'static str = "files.delete";
+    const ID: PointId = PointId::new("files.delete");
     const KIND: PointKind = PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -470,7 +490,8 @@ impl RelayedRequest for Delete {
 fn a_repeat_of_an_ask_still_running_waits_for_its_first_answer() {
     let node = full();
     node.declare::<Delete>(
-        PointSpec::new("Deletes.").relayable_request(Codec::request::<Delete>()),
+        PointSpec::new("Deletes.")
+            .facet(bus_kernel::bus_contract_crossing::relayable_request::<Delete>()),
     )
     .unwrap();
     let ran: Arc<Mutex<u32>> = Arc::default();
@@ -482,13 +503,13 @@ fn a_repeat_of_an_ask_still_running_waits_for_its_first_answer() {
         Ok(())
     })
     .unwrap();
-    let ask = RelayedAsk::new(1, 1, Delete::ID, WAIT, "/a", "");
+    let ask = RelayedAsk::new(1, 1, Delete::ID.as_str(), WAIT, "/a", "");
     let from = Origin::process("desktop");
     let answers: Vec<RelayedAnswer> = thread::scope(|s| {
         let both: Vec<_> = (0..2)
             .map(|_| {
                 let (node, ask, from) = (node.clone(), ask.clone(), from.clone());
-                s.spawn(move || Bus::relay(&*node).unwrap().answer(&from, ask))
+                s.spawn(move || BusCrossing::relay(&*node).unwrap().answer(&from, ask))
             })
             .collect();
         both.into_iter().map(|h| h.join().unwrap()).collect()

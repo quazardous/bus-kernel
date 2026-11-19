@@ -28,9 +28,10 @@ use std::time::Duration;
 use web_time::Instant;
 
 use bus_contract::{
-    Bus, Capability, Codec, Cursor, FailureKind, HookError, IngestError, LAST, ListenOpts,
-    OverBudget, Point, PointDecl, PointKind, PointSpec, Refused, Relayed, RelayedEntry,
-    declare_all, offers, order_dump,
+    Answer, Bus, Capability, Codec, Cursor, FailureKind, HookError, IngestError, LAST, ListenOpts,
+    Origin, OverBudget, Point, PointDecl, PointKey, PointKind, PointSpec, Refused, Relayed,
+    RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest, declare_all, far_listener, offers,
+    order_dump,
 };
 
 /// Builds a fresh bus for a check.
@@ -224,7 +225,40 @@ const CHECKS: &[Check] = &[
         &[Capability::Journal, Capability::Relay],
         relay_resume_and_ingest,
     ),
+    crossing(
+        "crossing.declared_requests_fail_closed_alter_never",
+        crossing_declared,
+    ),
+    crossing(
+        "crossing.answered_far_means_the_same",
+        crossing_answered_far_means_the_same,
+    ),
+    crossing("crossing.veto_carries_its_reason", crossing_veto_reason),
+    crossing("crossing.no_answer_in_time_refuses", crossing_no_answer),
+    crossing(
+        "crossing.far_side_keeps_the_deadline",
+        crossing_far_deadline,
+    ),
+    crossing("crossing.answered_once_per_origin", crossing_answered_once),
+    crossing(
+        "crossing.not_a_relayable_request_refused",
+        crossing_not_relayable_refused,
+    ),
+    crossing("crossing.origin_kept_on_entries", crossing_origin_kept),
+    crossing(
+        "crossing.authority_checks_asks_first",
+        crossing_authority_asks,
+    ),
+    crossing(
+        "crossing.authority_checks_events_panic_refuses",
+        crossing_authority_events,
+    ),
+    crossing("crossing.same_version_only", crossing_same_version),
 ];
+
+const fn crossing(name: &'static str, body: fn(Make)) -> Check {
+    needs(name, &[Capability::Journal, Capability::Relay], body)
+}
 
 // --- Points ---
 
@@ -1208,14 +1242,15 @@ fn relay_resume_and_ingest(make: Make) {
     assert!(rest.lost.is_none());
     assert_ne!(rest.next, Cursor::START);
 
+    let peer = Origin::process("peer");
     assert!(matches!(
-        relay.ingest("peer", RelayedEntry::new(1, Shared::ID, "not a number")),
+        relay.ingest(&peer, RelayedEntry::new(1, Shared::ID, "not a number")),
         Err(IngestError::Decode { .. })
     ));
     bus.declare::<Plain>(PointSpec::new("Not relayable."))
         .unwrap();
     assert!(matches!(
-        relay.ingest("peer", RelayedEntry::new(2, Plain::ID, "x")),
+        relay.ingest(&peer, RelayedEntry::new(2, Plain::ID, "x")),
         Err(IngestError::NotRelayable { .. })
     ));
     let heard: Arc<Mutex<Vec<u32>>> = Arc::default();
@@ -1225,9 +1260,469 @@ fn relay_resume_and_ingest(make: Make) {
         Ok(())
     })
     .unwrap();
-    relay
-        .ingest("peer", RelayedEntry::new(3, Shared::ID, "7"))
+    let seq = relay
+        .ingest(&peer, RelayedEntry::new(3, Shared::ID, "7"))
         .expect("ingested");
     assert!(journal.flush(WAIT));
     assert_eq!(*heard.lock().unwrap(), [7], "taken in as a local entry");
+    let kept = journal.since(seq - 1, 1).entries;
+    assert_eq!(kept[0].origin, Some(peer), "kept with its origin");
+}
+
+// --- Crossing: requests answered on the other side ---
+
+/// A request one bus answers for another; the value is what each side
+/// did.
+struct Delete;
+impl Point for Delete {
+    const ID: &'static str = "conformance.delete";
+    const KIND: PointKind = PointKind::Request;
+    type Input = String;
+    type Value = Vec<String>;
+}
+
+impl Relayed for Delete {
+    fn encode(input: &String) -> String {
+        input.clone()
+    }
+    fn decode(text: &str) -> Result<String, String> {
+        Ok(text.to_owned())
+    }
+}
+
+/// `a,b,c`; a `|` cannot be read.
+impl RelayedRequest for Delete {
+    fn encode_value(value: &Vec<String>) -> String {
+        value.join(",")
+    }
+    fn decode_value(text: &str) -> Result<Vec<String>, String> {
+        if text.contains('|') {
+            return Err("a `|` in the value".into());
+        }
+        Ok(text
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
+/// An alter point: it never crosses.
+struct Title;
+impl Point for Title {
+    const ID: &'static str = "conformance.title";
+    type Input = ();
+    type Value = String;
+}
+
+impl Relayed for Title {
+    fn encode(_: &()) -> String {
+        String::new()
+    }
+    fn decode(_: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Wide: an ask meant to be answered in time, on a loaded machine too.
+const ASK: Duration = Duration::from_secs(5);
+
+fn crossing_table(version: u32) -> [PointDecl; 2] {
+    [
+        PointDecl::of::<Shared>("Shared.")
+            .relayable(Codec::of::<Shared>())
+            .version(version),
+        PointDecl::of::<Delete>("Deletes.")
+            .relayable(Codec::request::<Delete>())
+            .version(version),
+    ]
+}
+
+fn asker() -> Origin {
+    Origin::process("asker")
+}
+
+fn crossing_bus(make: Make, version: u32) -> Arc<dyn Bus> {
+    let bus = make();
+    assert!(declare_all(&*bus, &crossing_table(version)).is_empty());
+    bus
+}
+
+/// An asker with a listener of its own before the far side's turn, and
+/// the far bus at `far_version`, linked by a direct call.
+fn asker_and_far(make: Make, far_version: u32) -> (Arc<dyn Bus>, Arc<dyn Bus>) {
+    let far = crossing_bus(make, far_version);
+    let here = crossing_bus(make, 1);
+    here.listen::<Delete>("here.confirm", ListenOpts::new(), |_, did| {
+        did.push("here.confirm".into());
+        Ok(())
+    })
+    .unwrap();
+    let link = far.clone();
+    here.listen_any(
+        PointKey::of::<Delete>(),
+        "here.far".into(),
+        ListenOpts::new().deadline(ASK).owner("bridge"),
+        far_listener(Codec::request::<Delete>(), ASK, 1, move |ask| {
+            Some(link.relay().unwrap().answer(&asker(), ask))
+        }),
+    )
+    .unwrap();
+    (here, far)
+}
+
+/// The far side's listener; what it was asked.
+fn far_deletes(far: &Arc<dyn Bus>) -> Arc<Mutex<Vec<String>>> {
+    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
+    let r = ran.clone();
+    far.listen::<Delete>("far.vault", ListenOpts::new(), move |path, did| {
+        r.lock().unwrap().push(path.clone());
+        did.push("far.vault".into());
+        Ok(())
+    })
+    .unwrap();
+    ran
+}
+
+fn ask(run: u64, id: u64, kind: &str, deadline: Duration, input: &str) -> RelayedAsk {
+    RelayedAsk::new(run, id, kind, deadline, input, "")
+}
+
+fn crossing_declared(make: Make) {
+    let bus = crossing_bus(make, 3);
+    let info = bus
+        .points()
+        .into_iter()
+        .find(|p| p.id == Delete::ID)
+        .expect("declared");
+    assert!(info.relayable, "a request crosses");
+    assert!(info.fail_closed, "a relayable request is fail-closed");
+    assert!(!info.journaled, "a request is not journaled");
+    assert_eq!(info.version, 3);
+
+    let bus = make();
+    let table = [
+        PointDecl::of::<Title>("A title.").relayable(Codec::of::<Title>()),
+        PointDecl::of::<Delete>("No value codec.").relayable(Codec::of::<Delete>()),
+    ];
+    assert_eq!(
+        declare_all(&*bus, &table),
+        [
+            Refused::NotCrossable { point: Title::ID },
+            Refused::NotCrossable { point: Delete::ID },
+        ]
+    );
+    assert!(bus.points().iter().all(|p| !p.declared), "nothing declared");
+    assert_eq!(
+        bus.declare::<Title>(PointSpec::new("A title.").relayable_request(Codec::of::<Title>())),
+        Err(Refused::NotCrossable { point: Title::ID }),
+        "declared one by one too"
+    );
+}
+
+fn crossing_answered_far_means_the_same(make: Make) {
+    let (here, far) = asker_and_far(make, 1);
+    let ran = far_deletes(&far);
+    let out = here.alter::<Delete>("/a.jpg".into(), Vec::new());
+    assert!(out.refused.is_none(), "{:?}", out.refused);
+    assert_eq!(out.value, ["here.confirm", "far.vault"]);
+    assert_eq!(*ran.lock().unwrap(), ["/a.jpg"]);
+    // The same request emitted on the far bus itself: the same value.
+    let local = far.alter::<Delete>("/a.jpg".into(), vec!["here.confirm".into()]);
+    assert_eq!(local.value, out.value);
+}
+
+fn crossing_veto_reason(make: Make) {
+    let (here, far) = asker_and_far(make, 1);
+    far.listen::<Delete>("far.guard", ListenOpts::new(), |_, _| {
+        Err(HookError::refuse("the volume is read-only"))
+    })
+    .unwrap();
+    let ran = far_deletes(&far);
+    let out = here.alter::<Delete>("/a.jpg".into(), Vec::new());
+    let refusal = out.refused.expect("refused");
+    assert_eq!(refusal.listener, "here.far");
+    assert!(!refusal.failed, "a veto, not a failure");
+    assert!(
+        refusal.reason.contains("far.guard") && refusal.reason.contains("read-only"),
+        "{}",
+        refusal.reason
+    );
+    assert!(
+        ran.lock().unwrap().is_empty(),
+        "the veto stopped the far side"
+    );
+    assert_eq!(out.value, ["here.confirm"], "the far edit is dropped");
+}
+
+fn crossing_no_answer(make: Make) {
+    type Reply = fn(&RelayedAsk) -> Option<RelayedAnswer>;
+    let cases: [(&str, Duration, Reply); 4] = [
+        ("no answer", ASK, |_| None),
+        ("a late answer", Duration::from_millis(20), |ask| {
+            thread::sleep(Duration::from_millis(80));
+            Some(RelayedAnswer::to(ask, Answer::Done { value: "x".into() }))
+        }),
+        ("an answer to another ask", ASK, |ask| {
+            let mut other = ask.clone();
+            other.id += 1;
+            Some(RelayedAnswer::to(
+                &other,
+                Answer::Done { value: "x".into() },
+            ))
+        }),
+        ("an unreadable answer", ASK, |ask| {
+            Some(RelayedAnswer::to(
+                ask,
+                Answer::Done {
+                    value: "a|b".into(),
+                },
+            ))
+        }),
+    ];
+    for (case, deadline, reply) in cases {
+        let bus = crossing_bus(make, 1);
+        bus.listen_any(
+            PointKey::of::<Delete>(),
+            "here.odd".into(),
+            ListenOpts::new().deadline(WAIT),
+            far_listener(Codec::request::<Delete>(), deadline, 1, move |ask| {
+                reply(&ask)
+            }),
+        )
+        .unwrap();
+        let out = bus.alter::<Delete>("/a.jpg".into(), Vec::new());
+        assert!(out.refused.is_some(), "{case} refuses");
+        assert!(out.value.is_empty(), "{case}: nothing kept");
+    }
+}
+
+fn crossing_far_deadline(make: Make) {
+    let far = crossing_bus(make, 1);
+    let ran = far_deletes(&far);
+    let relay = far.relay().unwrap();
+    let late = ask(1, 1, Delete::ID, Duration::ZERO, "/a");
+    thread::sleep(MS);
+    match relay.answer(&asker(), late).answer {
+        Answer::Refused { listener: None, .. } => {}
+        other => panic!("an ask past its deadline runs nothing: {other:?}"),
+    }
+    assert!(ran.lock().unwrap().is_empty(), "no listener ran");
+
+    // Listeners that end past the deadline: refused (failed), whatever
+    // they did, as the asker holds it.
+    far.listen::<Delete>("far.slow", ListenOpts::new().deadline(WAIT), |_, _| {
+        thread::sleep(Duration::from_millis(60));
+        Ok(())
+    })
+    .unwrap();
+    let slow = ask(1, 2, Delete::ID, Duration::from_millis(10), "/b");
+    match relay.answer(&asker(), slow).answer {
+        Answer::Refused { failed: true, .. } => {}
+        other => panic!("listeners ended past the deadline: {other:?}"),
+    }
+}
+
+fn crossing_answered_once(make: Make) {
+    let far = crossing_bus(make, 1);
+    let ran = far_deletes(&far);
+    let relay = far.relay().unwrap();
+    let first_ask = ask(7, 1, Delete::ID, ASK, "/a");
+    let first = relay.answer(&asker(), first_ask.clone());
+    let again = relay.answer(&asker(), first_ask.clone());
+    assert_eq!(first, again, "a repeat gets the first answer");
+    assert_eq!(
+        first.answer,
+        Answer::Done {
+            value: "far.vault".into()
+        }
+    );
+    assert_eq!(ran.lock().unwrap().len(), 1, "run once");
+    // Another run (the asker restarted) is another ask; so is the same
+    // number from another process.
+    let mut restarted = first_ask.clone();
+    restarted.run = 8;
+    relay.answer(&asker(), restarted);
+    assert_eq!(ran.lock().unwrap().len(), 2);
+    relay.answer(&Origin::process("other"), first_ask);
+    assert_eq!(ran.lock().unwrap().len(), 3);
+}
+
+fn crossing_not_relayable_refused(make: Make) {
+    let far = crossing_bus(make, 1);
+    far.declare::<Run>(PointSpec::new("Local only.")).unwrap();
+    let relay = far.relay().unwrap();
+    for (n, kind) in ["conformance.unknown", Run::ID, Shared::ID]
+        .into_iter()
+        .enumerate()
+    {
+        match relay
+            .answer(&asker(), ask(1, n as u64, kind, ASK, "1"))
+            .answer
+        {
+            Answer::Refused { listener: None, .. } => {}
+            other => panic!("{kind}: {other:?}"),
+        }
+    }
+    // An input or a value it cannot read.
+    let mut odd = ask(1, 10, Delete::ID, ASK, "/a");
+    odd.value = "a|b".into();
+    assert!(matches!(
+        relay.answer(&asker(), odd).answer,
+        Answer::Refused { listener: None, .. }
+    ));
+    // A request is asked, not ingested.
+    assert_eq!(
+        relay.ingest(&asker(), RelayedEntry::new(1, Delete::ID, "/a")),
+        Err(IngestError::NotRelayable {
+            kind: Delete::ID.into()
+        })
+    );
+}
+
+fn crossing_origin_kept(make: Make) {
+    let bus = crossing_bus(make, 1);
+    let journal = bus.journal().unwrap();
+    let from = Origin::process("agent-socket").agent("claude");
+    let seq = bus
+        .relay()
+        .unwrap()
+        .ingest(&from, RelayedEntry::new(1, Shared::ID, "5"))
+        .unwrap();
+    let unknown = bus
+        .relay()
+        .unwrap()
+        .ingest(&from, RelayedEntry::new(2, "conformance.unknown", "{}"))
+        .unwrap();
+    let kept = journal.since(seq - 1, 10).entries;
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0].origin, Some(from.clone()));
+    assert_eq!(kept[1].seq, unknown);
+    assert_eq!(kept[1].origin, Some(from), "an unknown kind too");
+    // Taken in, not served again.
+    assert!(
+        bus.relay()
+            .unwrap()
+            .resume(Cursor::START, 10)
+            .entries
+            .is_empty()
+    );
+}
+
+fn crossing_authority_asks(make: Make) {
+    let far = crossing_bus(make, 1);
+    let ran = far_deletes(&far);
+    let relay = far.relay().unwrap();
+    // What each crossing showed: origin, kind, version, ask.
+    type Seen = Vec<(String, String, u32, bool)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let s = seen.clone();
+    relay.authorize(move |c| {
+        s.lock()
+            .unwrap()
+            .push((c.origin.to_string(), c.kind.to_owned(), c.version, c.ask));
+        Ok(())
+    });
+    relay.authorize(|c| match &c.origin.agent {
+        Some(agent) if c.kind == Delete::ID => Err(format!("{agent} may not delete")),
+        _ => Ok(()),
+    });
+    let agent = asker().agent("claude");
+    assert_eq!(
+        relay
+            .answer(&agent, ask(1, 1, Delete::ID, ASK, "/a"))
+            .answer,
+        Answer::refused("claude may not delete")
+    );
+    assert!(ran.lock().unwrap().is_empty(), "nothing ran");
+    // Checked before anything is read: an unreadable ask is refused by
+    // the authority, not the codec.
+    let mut odd = ask(1, 2, Delete::ID, ASK, "/a");
+    odd.value = "a|b".into();
+    assert_eq!(
+        relay.answer(&agent, odd).answer,
+        Answer::refused("claude may not delete")
+    );
+    // The process itself is let through.
+    assert!(matches!(
+        relay
+            .answer(&asker(), ask(1, 3, Delete::ID, ASK, "/a"))
+            .answer,
+        Answer::Done { .. }
+    ));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "every ask shown, in order");
+    assert_eq!(
+        seen[0],
+        ("asker (agent claude)".into(), Delete::ID.into(), 1, true)
+    );
+}
+
+fn crossing_authority_events(make: Make) {
+    let bus = crossing_bus(make, 1);
+    let journal = bus.journal().unwrap();
+    let relay = bus.relay().unwrap();
+    let heard: Arc<Mutex<Vec<u32>>> = Arc::default();
+    let h = heard.clone();
+    bus.listen::<Shared>("shared", ListenOpts::new(), move |n, _| {
+        h.lock().unwrap().push(*n);
+        Ok(())
+    })
+    .unwrap();
+    relay.authorize(|c| {
+        assert!(!c.ask, "an event");
+        match c.origin.process.as_str() {
+            "rogue" => panic!("an authority panics"),
+            "banned" => Err("banned".into()),
+            _ => Ok(()),
+        }
+    });
+    let before = journal.last_seq();
+    for from in ["banned", "rogue"] {
+        let err = relay
+            .ingest(
+                &Origin::process(from),
+                RelayedEntry::new(1, Shared::ID, "not even a number"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, IngestError::Refused { .. }), "{from}: {err}");
+    }
+    assert_eq!(journal.last_seq(), before, "nothing recorded");
+    relay
+        .ingest(&asker(), RelayedEntry::new(2, Shared::ID, "9"))
+        .expect("let through");
+    assert!(journal.flush(WAIT));
+    assert_eq!(*heard.lock().unwrap(), [9], "only what was let through");
+}
+
+fn crossing_same_version(make: Make) {
+    let (here, far) = asker_and_far(make, 2);
+    let ran = far_deletes(&far);
+    let out = here.alter::<Delete>("/a.jpg".into(), Vec::new());
+    let refusal = out.refused.expect("another version refuses");
+    assert!(refusal.reason.contains("version"), "{}", refusal.reason);
+    assert!(ran.lock().unwrap().is_empty());
+
+    let relay = far.relay().unwrap();
+    let before = far.journal().unwrap().last_seq();
+    assert_eq!(
+        relay.ingest(&asker(), RelayedEntry::new(1, Shared::ID, "1")),
+        Err(IngestError::Version {
+            kind: Shared::ID.into(),
+            sent: 1,
+            here: 2
+        })
+    );
+    assert_eq!(
+        far.journal().unwrap().last_seq(),
+        before,
+        "nothing recorded"
+    );
+
+    // Served with its version.
+    let from = relay.cursor();
+    far.journal().unwrap().publish::<Shared>(3).unwrap();
+    let read = relay.resume(from, 10);
+    assert_eq!(read.entries.len(), 1);
+    assert_eq!(read.entries[0].version, 2);
 }

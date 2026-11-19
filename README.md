@@ -49,14 +49,24 @@ one failing contribution never breaks the others.
   `set_timing(false)` to stop counting). A pass over its point's budget
   (`PointSpec::budget`) goes to the `on_over_budget` sinks, its results
   kept.
-- **A journal and a relay from the host.** The contract's `Journal` and
-  `Relay` capabilities are the host's: `with_journal(journal)` and
-  `with_relay(relay)` hand them to the kernel, which then accepts points
-  declared journaled or relayable (refused without them) and refuses a
-  publish on a point not declared journaled before the host sees it.
-  The host's pump delivers each entry with a collect emit on the kernel,
-  off the publisher's thread; `declaration(id)` gives it a point's spec
-  and codec.
+- **A journal and a relay from the host.** The host keeps the entries:
+  `with_journal(journal)` (the contract's `Journal`) and
+  `with_relay(host)` (a `RelayHost`: read from a cursor, record what is
+  taken in) hand them to the kernel, which then accepts points declared
+  journaled or relayable (refused without them) and refuses a publish on
+  a point not declared journaled before the host sees it. The host's
+  pump delivers each entry with a collect emit on the kernel, off the
+  publisher's thread; `declaration(id)` gives it a point's spec and
+  codec.
+- **Crossing.** The kernel does the rest of bus-contract's crossing
+  itself: it holds the relay's authorities and shows them each crossing
+  before anything is decoded, recorded or run; refuses an entry of a
+  point not relayable here or at another version before the host sees
+  it; writes each point's version on the entries served; and answers
+  asks of relayable requests (`Relay::answer`) with an alter emit on
+  itself, fail-closed on the ask's deadline, once per origin (a repeat
+  gets the first answer, kept at least as long as the ask's deadline
+  and 30 s).
 - **Introspection.** `points()` lists every point and its listeners in
   the order they run, with their owners, constraints, deadlines, missing
   targets and counters (runs, failures, the last failure), for people,
@@ -172,12 +182,14 @@ checks of what bus-contract promises: declarations, listener order
 (`after`, `before`, `LAST`, priority), alter and collect, the error
 boundary, refusals and fail-closed requests, removal, local listeners,
 re-entrance, deadlines, introspection, and the `Defer`, `Timings`,
-`Journal` and `Relay` capabilities when the bus offers them. Another
+`Journal` and `Relay` capabilities when the bus offers them, with the
+`crossing` group (requests answered on another bus, vetoes, deadlines,
+answered once, origins, authorities, versions) on a bus with a relay. Another
 implementation runs them from its tests:
 
 ```toml
 [dev-dependencies]
-bus-kernel = { version = "0.1", features = ["conformance"] }
+bus-kernel = { version = "0.2", features = ["conformance"] }
 ```
 
 ```rust,ignore
@@ -195,7 +207,8 @@ suite on itself.
 ## Versions
 
 `bus-kernel` follows `bus-contract`'s minor versions: 0.1 implements
-bus-contract 0.3; a new contract minor brings a new kernel minor.
+bus-contract 0.3, 0.2 implements bus-contract 0.4; a new contract minor
+brings a new kernel minor.
 
 ## Next to an event bus, not on it
 

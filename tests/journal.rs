@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 
 use bus_kernel::bus_contract::{Bus, PointKey};
 use bus_kernel::{
-    Capability, Codec, Cursor, IngestError, Kernel, ListenOpts, Lost, Point, PointDecl, PointKind,
-    PointSpec, Refused, Relayed, RelayedEntry, declare_all, offers,
+    Answer, Capability, Codec, Cursor, IngestError, Kernel, ListenOpts, Lost, Origin, Point,
+    PointDecl, PointKind, PointSpec, Refused, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry,
+    RelayedRequest, declare_all, offers,
 };
 use memory::{Memory, full, kernel};
 
@@ -307,6 +308,10 @@ fn the_kernel_refuses_a_publish_on_a_point_not_journaled() {
 
 // --- Relay ---
 
+fn node_origin() -> Origin {
+    Origin::process("node")
+}
+
 type Heard = Arc<Mutex<Vec<Imported>>>;
 
 fn node_and_desktop() -> (Arc<Kernel>, Arc<Kernel>, Heard) {
@@ -353,7 +358,10 @@ fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
     assert_eq!(read.next, relay.cursor());
 
     for e in read.entries {
-        Bus::relay(&*desktop).unwrap().ingest("node", e).unwrap();
+        Bus::relay(&*desktop)
+            .unwrap()
+            .ingest(&node_origin(), e)
+            .unwrap();
     }
     let dj = Bus::journal(&*desktop).unwrap();
     assert!(dj.flush(WAIT));
@@ -362,7 +370,7 @@ fn relayable_events_resume_on_one_kernel_and_are_ingested_on_another() {
         [imported("/a", 1), imported("/b", 2)]
     );
     let kept = dj.since(0, 10);
-    assert_eq!(kept.entries[1].source.as_deref(), Some("node"));
+    assert_eq!(kept.entries[1].origin, Some(node_origin()));
     assert_eq!(kept.entries[1].cause, Some(1));
     // Taken in, not served again.
     assert!(
@@ -390,13 +398,16 @@ fn ingest_refuses_what_it_cannot_read_or_may_not_take() {
     let relay = Bus::relay(&*desktop).unwrap();
     relay
         .ingest(
-            "node",
+            &node_origin(),
             RelayedEntry::new(1, "library.imported", "/a|4|new-field"),
         )
         .unwrap();
     assert_eq!(
         relay
-            .ingest("node", RelayedEntry::new(2, "library.imported", "/a"))
+            .ingest(
+                &node_origin(),
+                RelayedEntry::new(2, "library.imported", "/a")
+            )
             .unwrap_err(),
         IngestError::Decode {
             kind: "library.imported".into(),
@@ -405,7 +416,7 @@ fn ingest_refuses_what_it_cannot_read_or_may_not_take() {
     );
     assert_eq!(
         relay
-            .ingest("node", RelayedEntry::new(3, "engine.step", "7"))
+            .ingest(&node_origin(), RelayedEntry::new(3, "engine.step", "7"))
             .unwrap_err(),
         IngestError::NotRelayable {
             kind: "engine.step".into()
@@ -414,11 +425,80 @@ fn ingest_refuses_what_it_cannot_read_or_may_not_take() {
     // Unknown here: kept as text, heard by no one.
     assert_eq!(
         relay
-            .ingest("node", RelayedEntry::new(4, "extract.item", "{}"))
+            .ingest(&node_origin(), RelayedEntry::new(4, "extract.item", "{}"))
             .unwrap(),
         2
     );
     let journal = Bus::journal(&*desktop).unwrap();
     assert!(journal.flush(WAIT));
     assert_eq!(*heard.lock().unwrap(), [imported("/a", 4)]);
+}
+
+// --- Crossing: the kernel's own part ---
+
+struct Delete;
+impl Point for Delete {
+    const ID: &'static str = "files.delete";
+    const KIND: PointKind = PointKind::Request;
+    type Input = String;
+    type Value = Vec<String>;
+}
+
+impl Relayed for Delete {
+    fn encode(input: &String) -> String {
+        input.clone()
+    }
+    fn decode(text: &str) -> Result<String, String> {
+        Ok(text.to_owned())
+    }
+}
+
+impl RelayedRequest for Delete {
+    fn encode_value(value: &Vec<String>) -> String {
+        value.join(",")
+    }
+    fn decode_value(text: &str) -> Result<Vec<String>, String> {
+        Ok(text
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
+#[test]
+fn a_repeat_of_an_ask_still_running_waits_for_its_first_answer() {
+    let node = full();
+    node.declare::<Delete>(
+        PointSpec::new("Deletes.").relayable_request(Codec::request::<Delete>()),
+    )
+    .unwrap();
+    let ran: Arc<Mutex<u32>> = Arc::default();
+    let r = ran.clone();
+    node.listen::<Delete>("node.slow", ListenOpts::new(), move |_, did| {
+        thread::sleep(Duration::from_millis(100));
+        *r.lock().unwrap() += 1;
+        did.push("node.slow".into());
+        Ok(())
+    })
+    .unwrap();
+    let ask = RelayedAsk::new(1, 1, Delete::ID, WAIT, "/a", "");
+    let from = Origin::process("desktop");
+    let answers: Vec<RelayedAnswer> = thread::scope(|s| {
+        let both: Vec<_> = (0..2)
+            .map(|_| {
+                let (node, ask, from) = (node.clone(), ask.clone(), from.clone());
+                s.spawn(move || Bus::relay(&*node).unwrap().answer(&from, ask))
+            })
+            .collect();
+        both.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(*ran.lock().unwrap(), 1, "run once");
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(
+        answers[0].answer,
+        Answer::Done {
+            value: "node.slow".into()
+        }
+    );
 }

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use bus_kernel::bus_contract::{AnyInput, Bus, FreshFn, PointKey};
 use bus_kernel::{
-    Cursor, IngestError, Journal, JournalEntry, Kernel, Lost, Refused, Relay, RelayedEntry,
-    Resumed, Since, kind_matches,
+    Cursor, IngestError, Journal, JournalEntry, Kernel, Lost, Origin, Refused, RelayHost,
+    RelayedEntry, Resumed, Since, kind_matches,
 };
 
 // --- The host's journal ---
@@ -171,7 +171,7 @@ impl Journal for Memory {
     }
 }
 
-impl Relay for Memory {
+impl RelayHost for Memory {
     fn cursor(&self) -> Cursor {
         Cursor {
             run: self.0.run,
@@ -199,7 +199,7 @@ impl Relay for Memory {
             let Some((_, spec)) = kernel.declaration(&e.kind) else {
                 continue;
             };
-            let (Some(codec), None, Some(input)) = (spec.relay, &e.source, &e.input) else {
+            let (Some(codec), None, Some(input)) = (spec.relay, &e.origin, &e.input) else {
                 continue;
             };
             let Some(text) = (codec.encode)(&**input) else {
@@ -220,10 +220,11 @@ impl Relay for Memory {
         out
     }
 
-    fn ingest(&self, source: &str, relayed: RelayedEntry) -> Result<u64, IngestError> {
+    /// The kernel checked the authorities, the kind and the version.
+    fn ingest(&self, origin: &Origin, relayed: RelayedEntry) -> Result<u64, IngestError> {
         let mut entry = JournalEntry::new(0, relayed.kind.clone());
         entry.cause = relayed.cause;
-        entry.source = Some(source.to_owned());
+        entry.origin = Some(origin.clone());
         let Some((key, spec)) = self.kernel().declaration(&relayed.kind) else {
             entry.text = Some(relayed.text);
             return Ok(self.0.record(entry, None));

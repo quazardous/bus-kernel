@@ -1,6 +1,6 @@
-//! The kernel runs the conformance suite on itself: bare (the Journal
-//! and Relay checks skipped) and with an in-memory host journal and
-//! relay (every check run).
+//! The kernel runs the conformance suite on itself: bare (the Journal,
+//! Relay and crossing checks skipped) and with an in-memory host journal
+//! and relay (every check run, the crossing group included).
 
 #![cfg(feature = "conformance")]
 
@@ -40,11 +40,11 @@ fn checks_needing_a_missing_capability_are_skipped() {
         .map(|(name, _)| *name)
         .collect();
     assert!(!skipped.is_empty());
-    assert!(
-        skipped
+    assert!(skipped.iter().all(|n| {
+        ["journal.", "relay.", "crossing."]
             .iter()
-            .all(|n| n.starts_with("journal.") || n.starts_with("relay."))
-    );
+            .any(|g| n.starts_with(g))
+    }));
     assert!(
         conformance::report(hosted)
             .iter()
@@ -56,4 +56,16 @@ fn checks_needing_a_missing_capability_are_skipped() {
             .iter()
             .any(|c| c.needs == [Capability::Defer])
     );
+}
+
+#[test]
+fn every_crossing_check_runs_and_passes_with_a_relay() {
+    let crossing: Vec<_> = conformance::report(hosted)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("crossing."))
+        .collect();
+    assert_eq!(crossing.len(), 11, "the crossing group");
+    for (name, outcome) in crossing {
+        assert_eq!(outcome, Outcome::Passed, "{name}");
+    }
 }

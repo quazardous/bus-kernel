@@ -4,6 +4,7 @@
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
+mod crossing;
 mod order;
 mod timing;
 
@@ -25,12 +26,13 @@ use web_time::Instant;
 /// below under their old paths.
 pub use bus_contract;
 pub use bus_contract::{
-    Altered, Capability, Codec, Collected, Cursor, DEFAULT_DEADLINE, Defer, FAILED_FACT, Failure,
-    FailureKind, HookError, IngestError, Journal, JournalEntry, LAST, ListenOpts, ListenerInfo,
-    ListenerTimings, Lost, OVER_BUDGET_FACT, OverBudget, PLUGIN_DEADLINE, PendingRun, Point,
-    PointDecl, PointInfo, PointKind, PointSpec, PointTimings, Refusal, Refused, Relay, Relayed,
-    RelayedEntry, Resumed, Since, TimingStats, Timings, declare_all, kind_matches, missing_targets,
-    offers, order_dump,
+    Altered, Answer, Authority, Capability, Codec, Collected, Crossing, Cursor, DEFAULT_DEADLINE,
+    Defer, FAILED_FACT, Failure, FailureKind, HookError, IngestError, Journal, JournalEntry, LAST,
+    ListenOpts, ListenerInfo, ListenerTimings, Lost, OVER_BUDGET_FACT, Origin, OverBudget,
+    PLUGIN_DEADLINE, PendingRun, Point, PointDecl, PointInfo, PointKind, PointSpec, PointTimings,
+    Refusal, Refused, Relay, Relayed, RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest,
+    Resumed, Since, TimingStats, Timings, ask_run, declare_all, far_listener, kind_matches,
+    missing_targets, offers, order_dump,
 };
 use bus_contract::{
     AnyInput, AnyListener, AnyLocalListener, AnyValue, BudgetSink, Bus, CloneFn, FailureSink,
@@ -154,7 +156,7 @@ impl Pass {
 }
 
 /// What a listener answered instead of a value.
-enum Answer {
+enum Verdict {
     /// It refused the request ([`HookError::Refuse`]).
     Refuse(String),
     /// It failed.
@@ -270,7 +272,9 @@ pub struct Kernel {
     /// caught and reported, never left half-done in the host's journal.
     journal: Option<AssertUnwindSafe<Arc<dyn Journal>>>,
     /// The host's relay ([`Kernel::with_relay`]), held as the journal is.
-    relay: Option<AssertUnwindSafe<Arc<dyn Relay>>>,
+    relay: Option<AssertUnwindSafe<Arc<dyn RelayHost>>>,
+    /// Authorities and the asks answered ([`Relay::answer`]).
+    crossings: crossing::Crossings,
 }
 
 impl fmt::Debug for Kernel {
@@ -315,6 +319,7 @@ impl Kernel {
             budget_sinks: RwLock::new(Vec::new()),
             journal: None,
             relay: None,
+            crossings: crossing::Crossings::default(),
         }
     }
 
@@ -349,11 +354,19 @@ impl Kernel {
     /// The kernel with the host's relay: it offers the contract's
     /// [`Relay`] capability ([`Bus::relay`]) when it has a journal too
     /// ([`Kernel::with_journal`]), so points may be declared relayable
-    /// ([`PointDecl::relayable`]). [`Relay::resume`] and
-    /// [`Relay::ingest`] go to `relay`, which finds each point's codec
-    /// in [`Kernel::declaration`] and records what it takes in through
-    /// its journal.
-    pub fn with_relay(mut self, relay: Arc<dyn Relay>) -> Kernel {
+    /// ([`PointDecl::relayable`]): events, and requests another process
+    /// may ask.
+    ///
+    /// The host keeps and reads entries ([`RelayHost`]); the kernel
+    /// does the rest of the contract's crossing itself: it holds the
+    /// authorities ([`Relay::add_authority`]) and checks each crossing
+    /// with them, refuses an entry of a point not relayable here or at
+    /// another version before the host sees it, writes each point's
+    /// version on the entries served, and answers asks
+    /// ([`Relay::answer`]) with an alter emit on itself, once per
+    /// origin, keeping each answer at least as long as the ask's
+    /// deadline (and 30 s).
+    pub fn with_relay(mut self, relay: Arc<dyn RelayHost>) -> Kernel {
         self.relay = Some(AssertUnwindSafe(relay));
         self
     }
@@ -398,11 +411,21 @@ impl Kernel {
         if spec.journaled && key.kind != PointKind::Event {
             return Err(Refused::NotEvent { point: key.id });
         }
-        if spec.relay.is_some_and(|c| c.point != key.id) {
-            return Err(Refused::TypeMismatch { point: key.id });
+        if let Some(codec) = spec.relay {
+            if codec.point != key.id {
+                return Err(Refused::TypeMismatch { point: key.id });
+            }
+            let crosses = match key.kind {
+                PointKind::Event => true,
+                PointKind::Request => codec.answers(),
+                _ => false,
+            };
+            if !crosses {
+                return Err(Refused::NotCrossable { point: key.id });
+            }
         }
         let needs = [
-            (spec.journaled || spec.relay.is_some(), Capability::Journal),
+            (spec.journaled, Capability::Journal),
             (spec.relay.is_some(), Capability::Relay),
         ];
         if let Some((_, capability)) = needs
@@ -801,15 +824,15 @@ impl Kernel {
 
     /// What a listener's refusal or failure means under `rules`; a
     /// failure is counted and sent to the sinks.
-    fn judge(&self, point: &'static str, entry: &Entry, answer: Answer, rules: Rules) -> Judged {
+    fn judge(&self, point: &'static str, entry: &Entry, answer: Verdict, rules: Rules) -> Judged {
         let kind = match answer {
-            Answer::Refuse(reason) if rules.request => {
+            Verdict::Refuse(reason) if rules.request => {
                 let refusal =
                     Refusal::new(point, entry.id.clone(), entry.opts.owner.clone(), reason);
                 return Judged::Stop(refusal, None);
             }
-            Answer::Refuse(reason) => FailureKind::Error(reason),
-            Answer::Fail(kind) => kind,
+            Verdict::Refuse(reason) => FailureKind::Error(reason),
+            Verdict::Fail(kind) => kind,
         };
         let failure = self.failed(point, entry, kind);
         if rules.fail_closed {
@@ -1156,6 +1179,7 @@ impl Kernel {
             info.budget = spec.budget;
             info.journaled = spec.journaled;
             info.relayable = spec.relay.is_some();
+            info.version = spec.version;
         }
         info.deadline = deadline;
         info.listeners = slot
@@ -1211,7 +1235,7 @@ impl Kernel {
         value: AnyValue,
         deadline: Duration,
         pass: &mut Pass,
-    ) -> Option<Result<AnyValue, Answer>> {
+    ) -> Option<Result<AnyValue, Verdict>> {
         let (result, took) = match &entry.run {
             Run::Shared(run) => {
                 entry.runs.fetch_add(1, Ordering::Relaxed);
@@ -1301,12 +1325,12 @@ fn timed(
     input: &AnyInput,
     value: AnyValue,
     deadline: Duration,
-) -> (Result<AnyValue, Answer>, Duration) {
+) -> (Result<AnyValue, Verdict>, Duration) {
     let start = Instant::now();
     let result = guarded(run, &**input, value);
     let took = start.elapsed();
     let result = match result {
-        Ok(_) if took > deadline => Err(Answer::Fail(FailureKind::Late {
+        Ok(_) if took > deadline => Err(Verdict::Fail(FailureKind::Late {
             deadline,
             took: Some(took),
         })),
@@ -1325,7 +1349,7 @@ fn call(
     input: &AnyInput,
     value: AnyValue,
     deadline: Duration,
-) -> (Result<AnyValue, Answer>, Duration) {
+) -> (Result<AnyValue, Verdict>, Duration) {
     if !entry.opts.threaded {
         return timed(&**run, input, value, deadline);
     }
@@ -1343,7 +1367,7 @@ fn threaded(
     input: &AnyInput,
     value: AnyValue,
     deadline: Duration,
-) -> Result<AnyValue, Answer> {
+) -> Result<AnyValue, Verdict> {
     let (tx, rx) = sync_channel(1);
     let run = run.clone();
     let input = input.clone();
@@ -1354,17 +1378,17 @@ fn threaded(
             let _ = tx.send(guarded(&*run, &*input, value));
         });
     if let Err(e) = spawned {
-        return Err(Answer::Fail(FailureKind::Error(format!(
+        return Err(Verdict::Fail(FailureKind::Error(format!(
             "could not start its thread: {e}"
         ))));
     }
     match rx.recv_timeout(deadline) {
         Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(Answer::Fail(FailureKind::Late {
+        Err(RecvTimeoutError::Timeout) => Err(Verdict::Fail(FailureKind::Late {
             deadline,
             took: None,
         })),
-        Err(RecvTimeoutError::Disconnected) => Err(Answer::Fail(FailureKind::Panic(
+        Err(RecvTimeoutError::Disconnected) => Err(Verdict::Fail(FailureKind::Panic(
             "its thread ended without an answer".to_owned(),
         ))),
     }
@@ -1374,12 +1398,12 @@ fn guarded(
     run: &ListenerFn,
     input: &(dyn Any + Send + Sync),
     mut value: AnyValue,
-) -> Result<AnyValue, Answer> {
+) -> Result<AnyValue, Verdict> {
     match catch_unwind(AssertUnwindSafe(|| run(input, &mut *value))) {
         Ok(Ok(())) => Ok(value),
-        Ok(Err(HookError::Refuse(reason))) => Err(Answer::Refuse(reason)),
-        Ok(Err(e)) => Err(Answer::Fail(FailureKind::Error(e.message().to_owned()))),
-        Err(payload) => Err(Answer::Fail(FailureKind::Panic(panic_message(
+        Ok(Err(HookError::Refuse(reason))) => Err(Verdict::Refuse(reason)),
+        Ok(Err(e)) => Err(Verdict::Fail(FailureKind::Error(e.message().to_owned()))),
+        Err(payload) => Err(Verdict::Fail(FailureKind::Panic(panic_message(
             payload.as_ref(),
         )))),
     }
@@ -1524,24 +1548,57 @@ impl Journal for Kernel {
     }
 }
 
-/// The host's relay ([`Kernel::with_relay`]).
+/// What a host keeps for the kernel's [`Relay`] ([`Kernel::with_relay`]):
+/// its journal's entries read from a cursor and taken in from another
+/// process. The kernel answers asks and checks authorities and versions
+/// itself; the host only reads and records.
+pub trait RelayHost: Send + Sync {
+    /// Where a reader that starts now stands ([`Relay::cursor`]).
+    fn cursor(&self) -> Cursor;
+
+    /// The relayable entries after `from`, at most `limit`
+    /// ([`Relay::resume`]); the kernel writes each one's point version.
+    fn resume(&self, from: Cursor, limit: usize) -> Resumed;
+
+    /// Records an entry relayed from `origin` and delivers it
+    /// ([`Relay::ingest`]), with the origin on its [`JournalEntry`]. The
+    /// kernel has already checked it with its authorities and refused a
+    /// point declared here not relayable, not an event, or at another
+    /// version; the host decodes it with its point's codec
+    /// ([`Kernel::declaration`]) or keeps an unknown kind as text.
+    fn ingest(&self, origin: &Origin, entry: RelayedEntry) -> Result<u64, IngestError>;
+}
+
+/// The host's relay ([`Kernel::with_relay`]) behind the kernel's own
+/// crossing: authorities, versions and answered asks.
 impl Relay for Kernel {
     fn cursor(&self) -> Cursor {
         self.relay.as_ref().map_or(Cursor::START, |r| r.cursor())
     }
 
     fn resume(&self, from: Cursor, limit: usize) -> Resumed {
-        match &self.relay {
-            Some(r) => r.resume(from, limit),
-            None => Resumed::new(Vec::new(), from),
+        let Some(relay) = &self.relay else {
+            return Resumed::new(Vec::new(), from);
+        };
+        let mut read = relay.resume(from, limit);
+        for e in &mut read.entries {
+            if let Some((_, spec)) = self.declaration(&e.kind) {
+                e.version = spec.version;
+            }
         }
+        read
     }
 
-    fn ingest(&self, source: &str, entry: RelayedEntry) -> Result<u64, IngestError> {
-        match &self.relay {
-            Some(r) => r.ingest(source, entry),
-            None => Err(IngestError::NotRelayable { kind: entry.kind }),
-        }
+    fn ingest(&self, origin: &Origin, entry: RelayedEntry) -> Result<u64, IngestError> {
+        self.ingest_crossing(origin, entry)
+    }
+
+    fn answer(&self, origin: &Origin, ask: RelayedAsk) -> RelayedAnswer {
+        self.answer_crossing(origin, ask)
+    }
+
+    fn add_authority(&self, authority: Authority) {
+        self.crossings.add_authority(authority);
     }
 }
 

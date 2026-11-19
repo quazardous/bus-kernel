@@ -1613,7 +1613,9 @@ fn crossing_authority_asks(make: Make) {
     let far = crossing_bus(make, 1);
     let ran = far_deletes(&far);
     let relay = far.relay().unwrap();
-    let seen: Arc<Mutex<Vec<(String, String, u32, bool)>>> = Arc::default();
+    // What each crossing showed: origin, kind, version, ask.
+    type Seen = Vec<(String, String, u32, bool)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
     let s = seen.clone();
     relay.authorize(move |c| {
         s.lock()

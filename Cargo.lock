@@ -11,10 +11,14 @@ checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 [[package]]
 name = "bus-contract"
 version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba445cf665b95f93e2c9d33e10556d9efad68b8719e286fe2b96e5f829ad7566"
 
 [[package]]
 name = "bus-contract-crossing"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e2fd12a6e93df12de5360efcd21187a664f6e6f3448098e652c69f0db8ebca4"
 dependencies = [
  "bus-contract",
  "bus-contract-journal",
@@ -23,6 +27,8 @@ dependencies = [
 [[package]]
 name = "bus-contract-defer"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c26252cd230e17ffcfa7d51bed9c2a58759d8daafd29156c832a50bc57975dd"
 dependencies = [
  "bus-contract",
 ]
@@ -30,6 +36,8 @@ dependencies = [
 [[package]]
 name = "bus-contract-journal"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f622fa481c98f00b77a24a8f2b20d4f9054e6a85789d0e1ef85eedef77d10e87"
 dependencies = [
  "bus-contract",
 ]
@@ -37,6 +45,8 @@ dependencies = [
 [[package]]
 name = "bus-contract-timings"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66a3f6b43a67c181bc725a0629db2d049fa7cff23e240e1c7b627efd6e33ab7d"
 dependencies = [
  "bus-contract",
 ]

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.2
+
+The capability lookup of bus-contract 0.4.4; requires bus-contract 0.4.4.
+
+- `Kernel` implements `Bus::capability`: `Defer` and `Timings` always,
+  `Journal` with a host journal, `Relay` with a journal and a relay. The
+  getters (`defer()`, `timings()`, `journal()`, `relay()`) now use the
+  contract's default, this lookup, so they cannot disagree with it.
+- New core check `capability.getter_and_lookup_agree`
+  (`core.capability.lookup-agrees`): each capability is reached through
+  its getter and through the lookup with the same answer, and `offers`
+  agrees. A bus that overrides the getters without implementing
+  `capability` fails it.
+- `conformance::GUARANTEES` is a copy of bus-contract 0.4.4's
+  `GUARANTEES.md`.
+
 ## 0.2.1
 
 Conformance grouped by contract; additive.

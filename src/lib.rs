@@ -35,8 +35,8 @@ pub use bus_contract::{
     missing_targets, offers, order_dump,
 };
 use bus_contract::{
-    AnyInput, AnyListener, AnyLocalListener, AnyValue, BudgetSink, Bus, CloneFn, FailureSink,
-    FreshFn, PendingWaker, PointKey,
+    AnyInput, AnyListener, AnyLocalListener, AnyValue, BudgetSink, Bus, Cast, CloneFn, FailureSink,
+    FreshFn, PendingWaker, PointKey, Provided,
 };
 use timing::Stats;
 
@@ -1486,25 +1486,34 @@ impl Bus for Kernel {
         Kernel::listeners(self, point)
     }
 
-    fn defer(&self) -> Option<&dyn Defer> {
-        Some(self)
-    }
-
-    fn timings(&self) -> Option<&dyn Timings> {
-        Some(self)
-    }
-
-    fn journal(&self) -> Option<&dyn Journal> {
-        self.journal.as_ref().map(|_| self as &dyn Journal)
-    }
-
-    fn relay(&self) -> Option<&dyn Relay> {
-        match (&self.journal, &self.relay) {
-            (Some(_), Some(_)) => Some(self as &dyn Relay),
-            _ => None,
+    /// `Defer` and `Timings` always; `Journal` with a journal
+    /// ([`Kernel::with_journal`]); `Relay` with a journal and a relay.
+    /// The getters (`defer()`, …) keep their default, this lookup, so the
+    /// two always agree.
+    fn capability(&self, contract: TypeId) -> Option<Provided<'_>> {
+        if contract == TypeId::of::<dyn Defer>() {
+            Some(Provided::new::<dyn Defer>(self, &AS_DEFER))
+        } else if contract == TypeId::of::<dyn Timings>() {
+            Some(Provided::new::<dyn Timings>(self, &AS_TIMINGS))
+        } else if contract == TypeId::of::<dyn Journal>() {
+            self.journal
+                .is_some()
+                .then(|| Provided::new::<dyn Journal>(self, &AS_JOURNAL))
+        } else if contract == TypeId::of::<dyn Relay>() {
+            (self.journal.is_some() && self.relay.is_some())
+                .then(|| Provided::new::<dyn Relay>(self, &AS_RELAY))
+        } else {
+            None
         }
     }
 }
+
+// The casts `Kernel::capability` hands out: from the kernel as `Any` to
+// each capability it implements.
+static AS_DEFER: Cast<dyn Defer> = |bus| bus.downcast_ref::<Kernel>().map(|k| k as _);
+static AS_TIMINGS: Cast<dyn Timings> = |bus| bus.downcast_ref::<Kernel>().map(|k| k as _);
+static AS_JOURNAL: Cast<dyn Journal> = |bus| bus.downcast_ref::<Kernel>().map(|k| k as _);
+static AS_RELAY: Cast<dyn Relay> = |bus| bus.downcast_ref::<Kernel>().map(|k| k as _);
 
 /// The host's journal ([`Kernel::with_journal`]), behind the kernel's
 /// own check of what may be published.

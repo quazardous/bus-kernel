@@ -7,21 +7,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bus_kernel::bus_contract::Bus;
+#[allow(unused_imports)]
+use bus_kernel::{BusCrossing, BusDefer, BusJournal, BusTimings};
 use bus_kernel::{
-    Capability, DEFAULT_DEADLINE, FailureKind, HookError, Kernel, ListenOpts, PLUGIN_DEADLINE,
-    Point, PointDecl, PointSpec, Refused, declare_all, offers,
+    DEFAULT_DEADLINE, FailureKind, HookError, Kernel, ListenOpts, PLUGIN_DEADLINE, Point,
+    PointDecl, PointId, PointSpec, Refused, declare_all, offers,
 };
 
 struct Trail;
 impl Point for Trail {
-    const ID: &'static str = "test.trail";
+    const ID: PointId = PointId::new("test.trail");
     type Input = ();
     type Value = Vec<String>;
 }
 
 struct Parts;
 impl Point for Parts {
-    const ID: &'static str = "test.parts";
+    const ID: PointId = PointId::new("test.parts");
     type Input = u32;
     type Value = Vec<u32>;
 }
@@ -29,14 +31,21 @@ impl Point for Parts {
 /// Same id as `Trail`, another type.
 struct Impostor;
 impl Point for Impostor {
-    const ID: &'static str = "test.trail";
+    const ID: PointId = PointId::new("test.trail");
     type Input = ();
     type Value = u8;
 }
 
+/// A listener id under the tests' `t.` prefix, as the conformance
+/// suite names them.
+fn lid(name: &str) -> String {
+    format!("t.{name}")
+}
+
+/// Registers `t.<id>`, which pushes `id` onto the trail.
 fn push(kernel: &Kernel, id: &'static str, opts: ListenOpts) {
     kernel
-        .listen::<Trail>(id, opts, move |_, v| {
+        .listen::<Trail>(lid(id), opts, move |_, v| {
             v.push(id.to_owned());
             Ok(())
         })
@@ -46,10 +55,10 @@ fn push(kernel: &Kernel, id: &'static str, opts: ListenOpts) {
 #[test]
 fn listeners_run_by_constraints_then_priority_then_registration() {
     let k = Kernel::new();
-    push(&k, "late", ListenOpts::new().after("core"));
+    push(&k, "late", ListenOpts::new().after("t.core"));
     push(&k, "core", ListenOpts::new());
     push(&k, "first", ListenOpts::new().priority(5));
-    push(&k, "guard", ListenOpts::new().before("core").priority(-9));
+    push(&k, "guard", ListenOpts::new().before("t.core").priority(-9));
     push(&k, "tail", ListenOpts::new());
     let out = k.alter::<Trail>((), Vec::new());
     assert!(out.failures.is_empty());
@@ -57,27 +66,28 @@ fn listeners_run_by_constraints_then_priority_then_registration() {
     assert_eq!(out.value, ["first", "tail", "guard", "core", "late"]);
     // Introspection shows the same order.
     let ids: Vec<_> = k
-        .listeners(Trail::ID)
+        .listeners(Trail::ID.as_str())
         .unwrap()
         .into_iter()
         .map(|l| l.id)
         .collect();
-    assert_eq!(ids, out.value);
+    let expected: Vec<_> = out.value.iter().map(|v| lid(v)).collect();
+    assert_eq!(ids, expected);
 }
 
 #[test]
 fn a_cycle_is_refused_and_changes_nothing() {
     let k = Kernel::new();
-    push(&k, "a", ListenOpts::new().after("b"));
+    push(&k, "a", ListenOpts::new().after("t.b"));
     let refused = k
-        .listen::<Trail>("b", ListenOpts::new().after("a"), |_, _| Ok(()))
+        .listen::<Trail>("t.b", ListenOpts::new().after("t.a"), |_, _| Ok(()))
         .unwrap_err();
     assert!(matches!(&refused, Refused::Cycle { path, .. } if path.len() == 3));
     assert!(refused.to_string().contains("cycle"));
-    assert_eq!(k.listeners(Trail::ID).unwrap().len(), 1);
+    assert_eq!(k.listeners(Trail::ID.as_str()).unwrap().len(), 1);
     // Itself as a target is a cycle too.
     assert!(matches!(
-        k.listen::<Trail>("me", ListenOpts::new().before("me"), |_, _| Ok(())),
+        k.listen::<Trail>("t.me", ListenOpts::new().before("t.me"), |_, _| Ok(())),
         Err(Refused::Cycle { .. })
     ));
 }
@@ -85,17 +95,20 @@ fn a_cycle_is_refused_and_changes_nothing() {
 #[test]
 fn a_missing_target_is_reported_and_ignored() {
     let k = Kernel::new();
-    push(&k, "a", ListenOpts::new().after("ghost").owner("m"));
+    push(&k, "a", ListenOpts::new().after("t.ghost").owner("m"));
     let out = k.alter::<Trail>((), Vec::new());
     assert_eq!(out.value, ["a"]);
     assert_eq!(out.failures.len(), 1);
     assert_eq!(
         out.failures[0].kind,
-        FailureKind::MissingTarget("ghost".into())
+        FailureKind::MissingTarget("t.ghost".into())
     );
     assert_eq!(out.failures[0].owner.as_deref(), Some("m"));
     assert!(!out.failures[0].dropped());
-    assert_eq!(k.listeners(Trail::ID).unwrap()[0].missing, ["ghost"]);
+    assert_eq!(
+        k.listeners(Trail::ID.as_str()).unwrap()[0].missing,
+        ["t.ghost"]
+    );
     // Once the target registers, the constraint holds.
     push(&k, "ghost", ListenOpts::new().priority(-1));
     let out = k.alter::<Trail>((), Vec::new());
@@ -108,11 +121,11 @@ fn duplicate_ids_and_mismatched_types_are_refused() {
     let k = Kernel::new();
     push(&k, "a", ListenOpts::new());
     assert!(matches!(
-        k.listen::<Trail>("a", ListenOpts::new(), |_, _| Ok(())),
+        k.listen::<Trail>("t.a", ListenOpts::new(), |_, _| Ok(())),
         Err(Refused::Duplicate { .. })
     ));
     assert_eq!(
-        k.listen::<Impostor>("x", ListenOpts::new(), |_, _| Ok(())),
+        k.listen::<Impostor>("t.x", ListenOpts::new(), |_, _| Ok(())),
         Err(Refused::TypeMismatch {
             point: "test.trail"
         })
@@ -140,12 +153,12 @@ fn duplicate_ids_and_mismatched_types_are_refused() {
 fn alter_keeps_only_the_edits_of_listeners_that_succeed() {
     let k = Kernel::new();
     push(&k, "one", ListenOpts::new());
-    k.listen::<Trail>("fails", ListenOpts::new(), |_, v| {
+    k.listen::<Trail>("t.fails", ListenOpts::new(), |_, v| {
         v.push("half".into());
         Err("refused".into())
     })
     .unwrap();
-    k.listen::<Trail>("panics", ListenOpts::new(), |_, v| {
+    k.listen::<Trail>("t.panics", ListenOpts::new(), |_, v| {
         v.clear();
         panic!("boom {}", 42);
     })
@@ -167,19 +180,19 @@ fn alter_keeps_only_the_edits_of_listeners_that_succeed() {
 #[test]
 fn collect_gathers_each_successful_listener_part_in_order() {
     let k = Kernel::new();
-    k.listen::<Parts>("double", ListenOpts::new(), |n, out| {
+    k.listen::<Parts>("t.double", ListenOpts::new(), |n, out| {
         out.push(n * 2);
         Ok(())
     })
     .unwrap();
-    k.listen::<Parts>("partial", ListenOpts::new().priority(1), |n, out| {
+    k.listen::<Parts>("t.partial", ListenOpts::new().priority(1), |n, out| {
         out.push(*n);
         Err("incomplete".into())
     })
     .unwrap();
-    k.listen::<Parts>("panics", ListenOpts::new(), |_, _| panic!("no"))
+    k.listen::<Parts>("t.panics", ListenOpts::new(), |_, _| panic!("no"))
         .unwrap();
-    k.listen::<Parts>("square", ListenOpts::new(), |n, out| {
+    k.listen::<Parts>("t.square", ListenOpts::new(), |n, out| {
         // Each listener starts from a fresh value.
         assert!(out.is_empty());
         out.extend([n * n, 1]);
@@ -190,19 +203,19 @@ fn collect_gathers_each_successful_listener_part_in_order() {
     assert_eq!(
         out.parts,
         [
-            ("double".to_string(), vec![6]),
-            ("square".to_string(), vec![9, 1])
+            ("t.double".to_string(), vec![6]),
+            ("t.square".to_string(), vec![9, 1])
         ]
     );
     let failed: Vec<_> = out.failures.iter().map(|f| f.listener.as_str()).collect();
-    assert_eq!(failed, ["partial", "panics"]);
+    assert_eq!(failed, ["t.partial", "t.panics"]);
 }
 
 #[test]
 fn an_inline_listener_past_its_deadline_counts_as_failed() {
     let k = Kernel::new();
     k.listen::<Trail>(
-        "slow",
+        "t.slow",
         ListenOpts::new().deadline(Duration::from_millis(5)),
         |_, v| {
             thread::sleep(Duration::from_millis(30));
@@ -231,18 +244,18 @@ fn a_threaded_listener_is_abandoned_at_its_deadline() {
     let k = Kernel::new();
     k.declare::<Parts>(PointSpec::new("parts").deadline(Duration::from_millis(50)))
         .unwrap();
-    k.listen::<Parts>("stuck", ListenOpts::new().threaded(), |_, out| {
+    k.listen::<Parts>("t.stuck", ListenOpts::new().threaded(), |_, out| {
         thread::sleep(Duration::from_secs(5));
         out.push(0);
         Ok(())
     })
     .unwrap();
-    k.listen::<Parts>("quick", ListenOpts::new().threaded(), |n, out| {
+    k.listen::<Parts>("t.quick", ListenOpts::new().threaded(), |n, out| {
         out.push(*n);
         Ok(())
     })
     .unwrap();
-    k.listen::<Parts>("crash", ListenOpts::new().threaded(), |_, _| {
+    k.listen::<Parts>("t.crash", ListenOpts::new().threaded(), |_, _| {
         panic!("in thread")
     })
     .unwrap();
@@ -250,7 +263,7 @@ fn a_threaded_listener_is_abandoned_at_its_deadline() {
     let out = k.collect::<Parts>(4);
     // The emit waited for the point's deadline, not for the stuck thread.
     assert!(start.elapsed() < Duration::from_secs(2));
-    assert_eq!(out.parts, [("quick".to_string(), vec![4])]);
+    assert_eq!(out.parts, [("t.quick".to_string(), vec![4])]);
     assert_eq!(
         out.failures[0].kind,
         FailureKind::Late {
@@ -266,22 +279,22 @@ fn deadlines_resolve_listener_then_point_then_kernel() {
     let k = Kernel::new();
     push(&k, "default", ListenOpts::new());
     push(&k, "plugin", ListenOpts::new().deadline(PLUGIN_DEADLINE));
-    let ls = k.listeners(Trail::ID).unwrap();
+    let ls = k.listeners(Trail::ID.as_str()).unwrap();
     assert_eq!(ls[0].deadline, DEFAULT_DEADLINE);
     assert_eq!(ls[1].deadline, PLUGIN_DEADLINE);
 
     let k = Kernel::with_default_deadline(Duration::from_millis(200));
     k.declare::<Parts>(PointSpec::new("p").deadline(Duration::from_millis(300)))
         .unwrap();
-    k.listen::<Parts>("a", ListenOpts::new(), |_, _| Ok(()))
+    k.listen::<Parts>("t.a", ListenOpts::new(), |_, _| Ok(()))
         .unwrap();
     push(&k, "b", ListenOpts::new());
     assert_eq!(
-        k.listeners(Parts::ID).unwrap()[0].deadline,
+        k.listeners(Parts::ID.as_str()).unwrap()[0].deadline,
         Duration::from_millis(300)
     );
     assert_eq!(
-        k.listeners(Trail::ID).unwrap()[0].deadline,
+        k.listeners(Trail::ID.as_str()).unwrap()[0].deadline,
         Duration::from_millis(200)
     );
 }
@@ -294,8 +307,8 @@ fn sinks_receive_dropped_contributions_only() {
     k.on_failure(move |f| sink.lock().unwrap().push(f.to_string()));
     // A sink that panics does not stop the others or the emit.
     k.on_failure(|_| panic!("bad sink"));
-    push(&k, "ok", ListenOpts::new().after("ghost"));
-    k.listen::<Trail>("bad", ListenOpts::new().owner("plugin.x"), |_, _| {
+    push(&k, "ok", ListenOpts::new().after("t.ghost"));
+    k.listen::<Trail>("t.bad", ListenOpts::new().owner("plugin.x"), |_, _| {
         Err("no disk".into())
     })
     .unwrap();
@@ -303,7 +316,7 @@ fn sinks_receive_dropped_contributions_only() {
     assert_eq!(out.failures.len(), 2);
     assert_eq!(
         *seen.lock().unwrap(),
-        ["hook `test.trail`, listener `bad`: failed: no disk"]
+        ["hook `test.trail`, listener `t.bad`: failed: no disk"]
     );
 }
 
@@ -313,8 +326,11 @@ fn introspection_lists_points_listeners_and_counters() {
     k.declare::<Parts>(PointSpec::new("Numbers, one list per listener"))
         .unwrap();
     k.listen::<Parts>(
-        "flaky",
-        ListenOpts::new().owner("mod.a").before("other").priority(3),
+        "t.flaky",
+        ListenOpts::new()
+            .owner("mod.a")
+            .before("t.other")
+            .priority(3),
         |n, _| if *n == 0 { Err("zero".into()) } else { Ok(()) },
     )
     .unwrap();
@@ -329,11 +345,11 @@ fn introspection_lists_points_listeners_and_counters() {
     assert!(parts.declared);
     assert_eq!(parts.description, "Numbers, one list per listener");
     let flaky = &parts.listeners[0];
-    assert_eq!(flaky.id, "flaky");
+    assert_eq!(flaky.id, "t.flaky");
     assert_eq!(flaky.owner.as_deref(), Some("mod.a"));
-    assert_eq!(flaky.before, ["other"]);
+    assert_eq!(flaky.before, ["t.other"]);
     assert_eq!(flaky.priority, 3);
-    assert_eq!(flaky.missing, ["other"]);
+    assert_eq!(flaky.missing, ["t.other"]);
     assert_eq!((flaky.runs, flaky.failures), (2, 1));
     assert!(flaky.last_failure.as_deref().unwrap().contains("zero"));
     assert!(!points[1].declared);
@@ -345,11 +361,11 @@ fn forget_and_unlisten_remove_listeners() {
     let k = Kernel::new();
     push(&k, "a", ListenOpts::new().owner("plugin"));
     push(&k, "b", ListenOpts::new());
-    k.listen::<Parts>("c", ListenOpts::new().owner("plugin"), |_, _| Ok(()))
+    k.listen::<Parts>("t.c", ListenOpts::new().owner("plugin"), |_, _| Ok(()))
         .unwrap();
     assert_eq!(k.forget("plugin"), 2);
-    assert!(k.unlisten(Trail::ID, "b"));
-    assert!(!k.unlisten(Trail::ID, "b"));
+    assert!(k.unlisten(Trail::ID.as_str(), "t.b"));
+    assert!(!k.unlisten(Trail::ID.as_str(), "t.b"));
     assert!(k.alter::<Trail>((), Vec::new()).value.is_empty());
     assert!(k.collect::<Parts>(1).parts.is_empty());
 }
@@ -357,18 +373,18 @@ fn forget_and_unlisten_remove_listeners() {
 #[test]
 fn listeners_may_reenter_the_kernel_and_emits_cross_threads() {
     let k = Arc::new(Kernel::new());
-    k.listen::<Parts>("n", ListenOpts::new(), |n, out| {
+    k.listen::<Parts>("t.n", ListenOpts::new(), |n, out| {
         out.push(*n);
         Ok(())
     })
     .unwrap();
     let inner = k.clone();
-    k.listen::<Trail>("reenter", ListenOpts::new(), move |_, v| {
+    k.listen::<Trail>("t.reenter", ListenOpts::new(), move |_, v| {
         // Emit and listen from inside a listener: no lock is held.
         let got = inner.collect::<Parts>(9);
         v.push(format!("{:?}", got.parts[0].1));
         inner
-            .listen::<Parts>("added", ListenOpts::new(), |_, _| Ok(()))
+            .listen::<Parts>("t.added", ListenOpts::new(), |_, _| Ok(()))
             .map_err(|e| e.to_string().into())
     })
     .unwrap();
@@ -396,20 +412,20 @@ fn a_last_listener_runs_after_every_other_one_and_is_alone() {
     push(
         &kernel,
         "late",
-        ListenOpts::new().after("early").priority(-10),
+        ListenOpts::new().after("t.early").priority(-10),
     );
     let out = kernel.alter::<Trail>((), Vec::new());
     assert_eq!(out.value, ["early", "late", "check"]);
     assert!(out.failures.is_empty(), "LAST is no missing target");
-    let listeners = kernel.listeners(Trail::ID).unwrap();
+    let listeners = kernel.listeners(Trail::ID.as_str()).unwrap();
     assert!(listeners[2].after.iter().any(|a| a == bus_kernel::LAST));
     assert!(ListenOpts::new().last().last().is_last());
     // A second last one: each would run after the other.
     let refused = kernel
-        .listen::<Trail>("check-too", ListenOpts::new().last(), |_, _| Ok(()))
+        .listen::<Trail>("t.check-too", ListenOpts::new().last(), |_, _| Ok(()))
         .unwrap_err();
     assert!(matches!(refused, Refused::Cycle { .. }), "{refused:?}");
-    assert_eq!(kernel.listeners(Trail::ID).unwrap().len(), 3);
+    assert_eq!(kernel.listeners(Trail::ID.as_str()).unwrap().len(), 3);
 }
 
 /// The kernel as an application hands it to a library: an
@@ -420,18 +436,18 @@ fn the_kernel_through_the_contract() {
     use bus_kernel::bus_contract::{Bus, PointKind};
     let bus: Arc<dyn Bus> = Arc::new(Kernel::new());
     bus.declare::<Trail>(PointSpec::new("a trail")).unwrap();
-    bus.listen::<Trail>("b", ListenOpts::new().after("a"), |_, v| {
+    bus.listen::<Trail>("t.b", ListenOpts::new().after("t.a"), |_, v| {
         v.push("b".into());
         Ok(())
     })
     .unwrap();
-    bus.listen::<Trail>("a", ListenOpts::new(), |_, v| {
+    bus.listen::<Trail>("t.a", ListenOpts::new(), |_, v| {
         v.push("a".into());
         Ok(())
     })
     .unwrap();
     bus.listen::<Trail>(
-        "slow",
+        "t.slow",
         ListenOpts::new()
             .last()
             .threaded()
@@ -451,17 +467,17 @@ fn the_kernel_through_the_contract() {
     ));
     assert_eq!(bus.points()[0].kind, PointKind::Alter);
     assert!(matches!(
-        bus.listen::<Impostor>("x", ListenOpts::new(), |_, _| Ok(())),
+        bus.listen::<Impostor>("t.x", ListenOpts::new(), |_, _| Ok(())),
         Err(Refused::TypeMismatch { .. })
     ));
-    bus.listen::<Parts>("double", ListenOpts::new(), |n, v| {
+    bus.listen::<Parts>("t.double", ListenOpts::new(), |n, v| {
         v.push(n * 2);
         Ok(())
     })
     .unwrap();
     assert_eq!(
         bus.collect::<Parts>(4).parts,
-        [("double".to_string(), vec![8])]
+        [("t.double".to_string(), vec![8])]
     );
 }
 
@@ -479,7 +495,7 @@ fn local_listeners_run_in_order_on_their_thread() {
     let mine = seen.clone();
     k.listen_local::<Trail>(
         "ui.panel",
-        ListenOpts::new().owner("ui").after("core"),
+        ListenOpts::new().owner("ui").after("t.core"),
         move |_, v| {
             mine.borrow_mut().push(v.clone());
             v.push("ui.panel".into());
@@ -513,16 +529,16 @@ fn local_listeners_run_in_order_on_their_thread() {
     assert_eq!(seen.borrow()[1], ["core", "tail"]);
     assert!(k.run_pending().is_empty());
 
-    let infos = k.listeners(Trail::ID).unwrap();
+    let infos = k.listeners(Trail::ID.as_str()).unwrap();
     assert!(infos[1].local && infos[1].runs == 2);
     assert!(
-        bus_kernel::order_dump(&*k, &[Trail::ID])
-            .contains("ui.panel (owner ui): local; after core")
+        bus_kernel::order_dump(&*k, &[Trail::ID.as_str()])
+            .contains("ui.panel (owner ui): local; after t.core")
     );
     assert_eq!(
         k.listen_local::<Trail>("ui.slow", ListenOpts::new().threaded(), |_, _| Ok(())),
         Err(Refused::Threaded {
-            point: Trail::ID,
+            point: Trail::ID.as_str(),
             listener: "ui.slow".into()
         })
     );
@@ -580,7 +596,7 @@ fn forget_removes_local_listeners_from_any_thread() {
     let ran = k.run_pending();
     assert!(ran[0].ran.is_empty(), "removed since the emit: not run");
     assert_eq!(Rc::strong_count(&held), 1, "its closure dropped here");
-    assert!(k.listeners(Trail::ID).unwrap().is_empty());
+    assert!(k.listeners(Trail::ID.as_str()).unwrap().is_empty());
 
     // Removed on its own thread: dropped at once.
     let mine = held.clone();
@@ -589,7 +605,7 @@ fn forget_removes_local_listeners_from_any_thread() {
         Ok(())
     })
     .unwrap();
-    assert!(k.unlisten(Trail::ID, "ui.again"));
+    assert!(k.unlisten(Trail::ID.as_str(), "ui.again"));
     assert_eq!(Rc::strong_count(&held), 1);
 }
 
@@ -609,7 +625,7 @@ fn a_deferred_collect_fills_fresh_values() {
         Ok(())
     })
     .unwrap();
-    k.listen::<Parts>("disk", ListenOpts::new(), |n, out| {
+    k.listen::<Parts>("t.disk", ListenOpts::new(), |n, out| {
         out.push(n + 1);
         Ok(())
     })
@@ -618,7 +634,7 @@ fn a_deferred_collect_fills_fresh_values() {
     let out = thread::spawn(move || other.collect::<Parts>(7))
         .join()
         .unwrap();
-    assert_eq!(out.parts, [("disk".to_string(), vec![8])]);
+    assert_eq!(out.parts, [("t.disk".to_string(), vec![8])]);
     assert_eq!(out.deferred, ["ui.badge"]);
     assert_eq!(k.run_pending()[0].ran, ["ui.badge"]);
     assert_eq!(*got.borrow(), [vec![7]]);
@@ -627,7 +643,7 @@ fn a_deferred_collect_fills_fresh_values() {
 /// A request whose listeners may refuse it.
 struct Run;
 impl Point for Run {
-    const ID: &'static str = "test.run";
+    const ID: PointId = PointId::new("test.run");
     const KIND: bus_kernel::PointKind = bus_kernel::PointKind::Request;
     type Input = String;
     type Value = Vec<String>;
@@ -636,7 +652,7 @@ impl Point for Run {
 /// `policy` (answering with `policy`), then `handler`.
 fn guarded(k: &Kernel, policy: impl Fn(&str) -> Result<(), HookError> + Send + Sync + 'static) {
     k.listen::<Run>(
-        "policy",
+        "t.policy",
         ListenOpts::new().owner("policy"),
         move |cmd, did| {
             did.push("policy".into());
@@ -644,10 +660,14 @@ fn guarded(k: &Kernel, policy: impl Fn(&str) -> Result<(), HookError> + Send + S
         },
     )
     .unwrap();
-    k.listen::<Run>("handler", ListenOpts::new().after("policy"), |cmd, did| {
-        did.push(format!("ran {cmd}"));
-        Ok(())
-    })
+    k.listen::<Run>(
+        "t.handler",
+        ListenOpts::new().after("t.policy"),
+        |cmd, did| {
+            did.push(format!("ran {cmd}"));
+            Ok(())
+        },
+    )
     .unwrap();
 }
 
@@ -675,11 +695,11 @@ fn a_refusal_stops_a_request_and_is_not_a_failure() {
     let refusal = out.refused.unwrap();
     assert_eq!(
         (refusal.listener.as_str(), refusal.owner.as_deref()),
-        ("policy", Some("policy"))
+        ("t.policy", Some("policy"))
     );
     assert_eq!(
         refusal.to_string(),
-        "hook `test.run`: refused by `policy`: agents may not delete"
+        "hook `test.run`: refused by `t.policy`: agents may not delete"
     );
     assert_eq!(*sunk.lock().unwrap(), 0);
     let info = k.listeners("test.run").unwrap();
@@ -695,11 +715,11 @@ fn a_refusal_stops_a_request_and_is_not_a_failure() {
 #[test]
 fn a_refusal_off_a_request_counts_as_a_failure() {
     let k = Kernel::new();
-    k.listen::<Trail>("picky", ListenOpts::new(), |_, _| {
+    k.listen::<Trail>("t.picky", ListenOpts::new(), |_, _| {
         Err(HookError::refuse("no"))
     })
     .unwrap();
-    push(&k, "after", ListenOpts::new().after("picky"));
+    push(&k, "after", ListenOpts::new().after("t.picky"));
     let out = k.alter::<Trail>((), vec![]);
     assert_eq!(out.value, ["after"]);
     assert!(out.refused.is_none());
@@ -742,7 +762,7 @@ fn a_fail_closed_request_refuses_on_an_error_a_panic_or_a_missed_deadline() {
     k.declare::<Run>(PointSpec::new("runs").fail_closed())
         .unwrap();
     k.listen::<Run>(
-        "policy",
+        "t.policy",
         ListenOpts::new()
             .threaded()
             .deadline(Duration::from_millis(20)),
@@ -752,10 +772,14 @@ fn a_fail_closed_request_refuses_on_an_error_a_panic_or_a_missed_deadline() {
         },
     )
     .unwrap();
-    k.listen::<Run>("handler", ListenOpts::new().after("policy"), |_, did| {
-        did.push("ran".into());
-        Ok(())
-    })
+    k.listen::<Run>(
+        "t.handler",
+        ListenOpts::new().after("t.policy"),
+        |_, did| {
+            did.push("ran".into());
+            Ok(())
+        },
+    )
     .unwrap();
     let start = Instant::now();
     let out = k.alter::<Run>("x".into(), vec![]);
@@ -789,7 +813,7 @@ fn a_refused_request_queues_nothing_and_a_queued_refusal_stops_the_rest() {
         },
     )
     .unwrap();
-    k.listen::<Run>("gate", ListenOpts::new().after("ui.after"), |cmd, _| {
+    k.listen::<Run>("t.gate", ListenOpts::new().after("ui.after"), |cmd, _| {
         if cmd == "format" {
             Err(HookError::refuse("never"))
         } else {
@@ -802,7 +826,7 @@ fn a_refused_request_queues_nothing_and_a_queued_refusal_stops_the_rest() {
     let out = thread::spawn(move || other.alter::<Run>("format".into(), vec![]))
         .join()
         .unwrap();
-    assert_eq!(out.refused.unwrap().listener, "gate");
+    assert_eq!(out.refused.unwrap().listener, "t.gate");
     assert!(out.deferred.is_empty());
     assert!(k.run_pending().is_empty());
 
@@ -821,8 +845,9 @@ fn a_refused_request_queues_nothing_and_a_queued_refusal_stops_the_rest() {
 fn the_kernel_offers_defer() {
     let k = Kernel::new();
     let bus: &dyn Bus = &k;
-    assert!(offers(bus, Capability::Defer));
-    const NEEDS: &[PointDecl] = &[PointDecl::of::<Run>("runs").needs(&[Capability::Defer])];
+    assert!(offers(bus, &bus_kernel::bus_contract_defer::CONTRACT));
+    const NEEDS: &[PointDecl] =
+        &[PointDecl::of::<Run>("runs").needs(&[&bus_kernel::bus_contract_defer::CONTRACT])];
     assert!(declare_all(bus, NEEDS).is_empty());
 }
 
@@ -833,7 +858,7 @@ fn asks_run_at_the_drain_in_order_and_an_ask_while_draining_waits() {
     let heard: Arc<Mutex<Vec<String>>> = Arc::default();
     let h = heard.clone();
     let again = Arc::downgrade(&k);
-    k.listen::<Run>("persist", ListenOpts::new(), move |what, did| {
+    k.listen::<Run>("t.persist", ListenOpts::new(), move |what, did| {
         match what.as_str() {
             "locked" => return Err(HookError::refuse("read-only")),
             "broken" => return Err("disk full".into()),
@@ -870,7 +895,7 @@ fn asks_run_at_the_drain_in_order_and_an_ask_while_draining_waits() {
     assert_eq!(ran.len(), 3);
     assert_eq!(
         (ran[0].ask, ran[0].ran.as_slice()),
-        (Some(first), &["persist".to_string()][..])
+        (Some(first), &["t.persist".to_string()][..])
     );
     assert_eq!(ran[1].refused.as_ref().unwrap().reason, "read-only");
     assert_eq!(
@@ -891,7 +916,7 @@ fn asks_belong_to_the_asking_thread() {
     let k = Arc::new(Kernel::new());
     let heard: Arc<Mutex<Vec<String>>> = Arc::default();
     let h = heard.clone();
-    k.listen::<Run>("persist", ListenOpts::new(), move |what, _| {
+    k.listen::<Run>("t.persist", ListenOpts::new(), move |what, _| {
         h.lock().unwrap().push(what.clone());
         Ok(())
     })

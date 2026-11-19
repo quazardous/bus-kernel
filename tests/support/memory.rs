@@ -199,7 +199,11 @@ impl RelayHost for Memory {
             let Some((_, spec)) = kernel.declaration(&e.kind) else {
                 continue;
             };
-            let (Some(codec), None, Some(input)) = (spec.relay, &e.origin, &e.input) else {
+            let (Some(codec), None, Some(input)) = (
+                bus_kernel::bus_contract_crossing::codec(&spec.facets),
+                &e.origin,
+                &e.input,
+            ) else {
                 continue;
             };
             let Some(text) = (codec.encode)(&**input) else {
@@ -229,7 +233,7 @@ impl RelayHost for Memory {
             entry.text = Some(relayed.text);
             return Ok(self.0.record(entry, None));
         };
-        let Some(codec) = spec.relay else {
+        let Some(codec) = bus_kernel::bus_contract_crossing::codec(&spec.facets) else {
             return Err(IngestError::NotRelayable { kind: relayed.kind });
         };
         let input = (codec.decode)(&relayed.text).map_err(|reason| IngestError::Decode {

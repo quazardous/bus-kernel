@@ -89,12 +89,12 @@ ideas (listener ids, dependency ordering, an error boundary) come from
 ## Collect: each listener adds its part
 
 ```rust
-use bus_kernel::{Kernel, ListenOpts, Point, PointSpec};
+use bus_kernel::{Kernel, ListenOpts, Point, PointId, PointSpec};
 
 /// The findings of a health report: each check adds its own.
 struct HealthReport;
 impl Point for HealthReport {
-    const ID: &'static str = "health.report";
+    const ID: PointId = PointId::new("health.report");
     type Input = ();
     type Value = Vec<String>;
 }
@@ -124,31 +124,31 @@ assert_eq!(report.failures[0].listener, "gpu.driver");
 ## Alter: the value goes through the listeners in order
 
 ```rust
-use bus_kernel::{Kernel, ListenOpts, Point};
+use bus_kernel::{Kernel, ListenOpts, Point, PointId};
 
 /// The entries of a menu, which plugins may add to or reorder.
 struct FileMenu;
 impl Point for FileMenu {
-    const ID: &'static str = "menu.file";
+    const ID: PointId = PointId::new("menu.file");
     type Input = ();
     type Value = Vec<&'static str>;
 }
 
 let kernel = Kernel::new();
 kernel
-    .listen::<FileMenu>("sort", ListenOpts::new().after("export"), |_, items| {
+    .listen::<FileMenu>("menu.sort", ListenOpts::new().after("menu.export"), |_, items| {
         items.sort();
         Ok(())
     })
     .unwrap();
 kernel
-    .listen::<FileMenu>("export", ListenOpts::new(), |_, items| {
+    .listen::<FileMenu>("menu.export", ListenOpts::new(), |_, items| {
         items.push("Export");
         Ok(())
     })
     .unwrap();
 kernel
-    .listen::<FileMenu>("broken", ListenOpts::new().priority(10), |_, items| {
+    .listen::<FileMenu>("menu.broken", ListenOpts::new().priority(10), |_, items| {
         items.clear();
         panic!("half-way through");
     })
@@ -189,7 +189,7 @@ implementation runs them from its tests:
 
 ```toml
 [dev-dependencies]
-bus-kernel = { version = "0.2", features = ["conformance"] }
+bus-kernel = { version = "0.3", features = ["conformance"] }
 ```
 
 ```rust,ignore
@@ -217,8 +217,10 @@ check naming an id the page does not have.
 ## Versions
 
 `bus-kernel` follows `bus-contract`'s minor versions: 0.1 implements
-bus-contract 0.3, 0.2 implements bus-contract 0.4; a new contract minor
-brings a new kernel minor.
+bus-contract 0.3, 0.2 implements bus-contract 0.4, 0.3 implements
+bus-contract 0.5 with its capability contracts at 0.2
+(`bus-contract-defer`, `-timings`, `-journal`, `-crossing`); a new
+contract minor brings a new kernel minor.
 
 ## Next to an event bus, not on it
 

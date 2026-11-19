@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bus_contract::TimingStats;
+use bus_contract_timings::TimingStats;
 
 /// Buckets of √2 steps (as halves of each power of two) from 1 µs
 /// (1024 ns): bucket 0 holds what took under 1 µs, the last one

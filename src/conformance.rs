@@ -11,6 +11,23 @@
 //! }
 //! ```
 //!
+//! The checks are grouped by contract ([`Contract`]): `core`, `defer`,
+//! `timings`, `journal` and `crossing`, as bus-contract's guarantees
+//! page splits them. [`run`] runs every group; [`run_contract`] runs
+//! one, for an implementation that offers a capability and wants its
+//! checks alone. Each check names the property ids of the guarantees
+//! page it proves ([`Check::proves`]); the page ships with this crate
+//! ([`GUARANTEES`], [`properties`]), and [`summary`] writes what each
+//! check gave with its ids, then the properties no check proves.
+//!
+//! ```ignore
+//! #[test]
+//! fn my_journal_keeps_its_contract() {
+//!     use bus_kernel::conformance::{Contract, run_contract};
+//!     run_contract(Contract::Journal, || std::sync::Arc::new(MyBus::new()));
+//! }
+//! ```
+//!
 //! Each check builds the buses it needs with `make`, fresh ones, so a
 //! check never sees another's points. A check needing a capability the
 //! bus does not offer ([`Capability`]) is skipped, not failed. Times are
@@ -21,21 +38,103 @@ use std::cell::RefCell;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use web_time::Instant;
 
 use bus_contract::{
     Answer, Bus, Capability, Codec, Cursor, FailureKind, HookError, IngestError, LAST, ListenOpts,
-    Origin, OverBudget, Point, PointDecl, PointKey, PointKind, PointSpec, Refused, Relayed,
+    Lost, Origin, OverBudget, Point, PointDecl, PointKey, PointKind, PointSpec, Refused, Relayed,
     RelayedAnswer, RelayedAsk, RelayedEntry, RelayedRequest, declare_all, far_listener, offers,
     order_dump,
 };
 
 /// Builds a fresh bus for a check.
 pub type Make = fn() -> Arc<dyn Bus>;
+
+/// A part of bus-contract, as its guarantees page splits it: each check
+/// belongs to one, and a group can be run on its own
+/// ([`run_contract`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Contract {
+    /// The `Bus` trait, offered by every implementation.
+    Core,
+    /// The `Defer` capability.
+    Defer,
+    /// The `Timings` capability.
+    Timings,
+    /// The `Journal` capability.
+    Journal,
+    /// The `Relay` capability, on top of the journal.
+    Crossing,
+}
+
+impl Contract {
+    /// Every contract, in the guarantees page's order.
+    pub const ALL: [Contract; 5] = [
+        Contract::Core,
+        Contract::Defer,
+        Contract::Timings,
+        Contract::Journal,
+        Contract::Crossing,
+    ];
+
+    /// Its name, the first part of its property ids: `core`, `defer`,
+    /// `timings`, `journal`, `crossing`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Contract::Core => "core",
+            Contract::Defer => "defer",
+            Contract::Timings => "timings",
+            Contract::Journal => "journal",
+            Contract::Crossing => "crossing",
+        }
+    }
+
+    /// The capabilities a bus offers when it offers this contract.
+    pub const fn needs(self) -> &'static [Capability] {
+        match self {
+            Contract::Core => &[],
+            Contract::Defer => &[Capability::Defer],
+            Contract::Timings => &[Capability::Timings],
+            Contract::Journal => &[Capability::Journal],
+            Contract::Crossing => &[Capability::Journal, Capability::Relay],
+        }
+    }
+}
+
+impl fmt::Display for Contract {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The guarantees page of bus-contract (`GUARANTEES.md`), as this
+/// release of the suite was written against: the source of
+/// [`properties`].
+pub const GUARANTEES: &str = include_str!("conformance/GUARANTEES.md");
+
+/// Every property id of the guarantees page ([`GUARANTEES`]), in its
+/// order: the first cell of each table row, `<contract>.<area>.<property>`.
+pub fn properties() -> Vec<&'static str> {
+    GUARANTEES
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split_once("` |").map(|(id, _)| id))
+        .collect()
+}
+
+/// The property ids of the guarantees page no check proves: stated, a
+/// non-guarantee, or a matter for benchmarks.
+pub fn unproved() -> Vec<&'static str> {
+    properties()
+        .into_iter()
+        .filter(|id| !checks().iter().any(|c| c.proves.contains(id)))
+        .collect()
+}
 
 /// One check of the suite.
 #[derive(Clone, Copy)]
@@ -44,6 +143,11 @@ pub struct Check {
     pub name: &'static str,
     /// The capabilities it needs; without one, it is skipped.
     pub needs: &'static [Capability],
+    /// The contract it belongs to.
+    pub contract: Contract,
+    /// The property ids of the guarantees page ([`properties`]) it
+    /// proves, wholly or in part.
+    pub proves: &'static [&'static str],
     body: fn(Make),
 }
 
@@ -52,6 +156,8 @@ impl fmt::Debug for Check {
         f.debug_struct("Check")
             .field("name", &self.name)
             .field("needs", &self.needs)
+            .field("contract", &self.contract)
+            .field("proves", &self.proves)
             .finish_non_exhaustive()
     }
 }
@@ -89,9 +195,14 @@ impl Check {
     }
 }
 
-/// Every check, by group.
+/// Every check, grouped by contract in [`Contract::ALL`]'s order.
 pub fn checks() -> &'static [Check] {
     CHECKS
+}
+
+/// The checks of one contract, in order.
+pub fn checks_of(contract: Contract) -> impl Iterator<Item = &'static Check> {
+    checks().iter().filter(move |c| c.contract == contract)
 }
 
 /// Runs every check and returns each one's outcome, in order.
@@ -99,12 +210,28 @@ pub fn report(make: Make) -> Vec<(&'static str, Outcome)> {
     checks().iter().map(|c| (c.name, c.run(make))).collect()
 }
 
-/// Runs every check; panics naming each failed one and why.
+/// Runs one contract's checks and returns each one's outcome, in order.
+pub fn report_contract(contract: Contract, make: Make) -> Vec<(&'static str, Outcome)> {
+    checks_of(contract).map(|c| (c.name, c.run(make))).collect()
+}
+
+/// Runs every check; panics naming each failed one, the properties it
+/// proves, and why.
 pub fn run(make: Make) {
-    let failed: Vec<String> = report(make)
-        .into_iter()
-        .filter_map(|(name, outcome)| match outcome {
-            Outcome::Failed(why) => Some(format!("- {name}: {why}")),
+    fail_on(checks().iter(), make);
+}
+
+/// Runs one contract's checks; panics naming each failed one, the
+/// properties it proves, and why. A bus without the contract's
+/// capabilities skips them all.
+pub fn run_contract(contract: Contract, make: Make) {
+    fail_on(checks_of(contract), make);
+}
+
+fn fail_on<'a>(checks: impl Iterator<Item = &'a Check>, make: Make) {
+    let failed: Vec<String> = checks
+        .filter_map(|c| match c.run(make) {
+            Outcome::Failed(why) => Some(format!("- {} [{}]: {why}", c.name, c.proves.join(", "))),
             _ => None,
         })
         .collect();
@@ -116,149 +243,414 @@ pub fn run(make: Make) {
     );
 }
 
-const fn check(name: &'static str, body: fn(Make)) -> Check {
+/// Runs every check and writes what each gave, by contract, with the
+/// properties it proves, then the properties no check proves: a text
+/// for a person reading a test's output.
+pub fn summary(make: Make) -> String {
+    use fmt::Write as _;
+    let mut out = String::new();
+    for contract in Contract::ALL {
+        let _ = writeln!(out, "{contract}");
+        for c in checks_of(contract) {
+            let outcome = match c.run(make) {
+                Outcome::Passed => "passed".to_owned(),
+                Outcome::Skipped(cap) => format!("skipped (no {cap:?})"),
+                Outcome::Failed(why) => format!("FAILED: {why}"),
+            };
+            let _ = writeln!(out, "  {}: {outcome}", c.name);
+            let _ = writeln!(out, "    proves {}", c.proves.join(", "));
+        }
+    }
+    let _ = writeln!(out, "not proved by a check");
+    for id in unproved() {
+        let _ = writeln!(out, "  {id}");
+    }
+    out
+}
+
+/// A check of `contract`, run when the bus offers it.
+const fn check(
+    contract: Contract,
+    name: &'static str,
+    proves: &'static [&'static str],
+    body: fn(Make),
+) -> Check {
     Check {
         name,
-        needs: &[],
+        needs: contract.needs(),
+        contract,
+        proves,
         body,
     }
 }
 
-const fn needs(name: &'static str, needs: &'static [Capability], body: fn(Make)) -> Check {
-    Check { name, needs, body }
-}
+use Contract::{Core, Crossing, Defer as Deferred, Journal as Journaled, Timings as Timed};
 
 const CHECKS: &[Check] = &[
-    check("declare.once_and_typed", declare_once_and_typed),
+    // core
     check(
+        Core,
+        "declare.once_and_typed",
+        &["core.declare.once-typed"],
+        declare_once_and_typed,
+    ),
+    check(
+        Core,
         "declare.missing_capability_refused",
+        &["core.declare.table-checked"],
         missing_capability_refused,
     ),
     check(
+        Core,
         "order.constraints_priority_registration",
+        &["core.order.declared"],
         order_constraints_priority_registration,
     ),
     check(
+        Core,
         "order.cycle_refused_unchanged",
+        &["core.order.cycle-refused"],
         order_cycle_refused_unchanged,
     ),
     check(
+        Core,
         "order.missing_target_reported_ignored",
+        &["core.order.missing-target"],
         order_missing_target_reported_ignored,
     ),
     check(
+        Core,
         "order.last_runs_after_all_alone",
+        &["core.order.last"],
         order_last_runs_after_all_alone,
     ),
     check(
+        Core,
         "emit.alter_keeps_successful_edits",
+        &["core.alter.chain", "core.failure.isolated"],
         alter_keeps_successful_edits,
     ),
     check(
+        Core,
         "emit.collect_gathers_fresh_parts",
+        &["core.collect.fresh-parts"],
         collect_gathers_fresh_parts,
     ),
     check(
+        Core,
         "emit.failure_sinks_hear_dropped_only",
+        &["core.failure.isolated", "core.failure.sinks"],
         failure_sinks_hear_dropped_only,
     ),
     check(
+        Core,
         "emit.reentrant_and_cross_thread",
+        &["core.reentrant.no-lock", "core.thread.shared"],
         reentrant_and_cross_thread,
     ),
     check(
+        Core,
+        "emit.listen_on_the_emitting_point",
+        &["core.reentrant.no-lock"],
+        listen_on_the_emitting_point,
+    ),
+    check(
+        Core,
         "request.refusal_stops_not_a_failure",
+        &["core.request.veto-stops"],
         refusal_stops_not_a_failure,
     ),
     check(
+        Core,
         "request.refusal_off_a_request_fails",
+        &[
+            "core.request.refuse-elsewhere-fails",
+            "core.kind.not-declarative",
+        ],
         refusal_off_a_request_fails,
     ),
-    check("request.fail_closed_refuses", fail_closed_refuses),
-    check("remove.unlisten_and_forget", unlisten_and_forget),
-    check("local.ordered_and_queued", local_ordered_and_queued),
-    check("local.error_boundary", local_error_boundary),
-    check("local.forget_from_any_thread", local_forget_from_any_thread),
-    check("local.deferred_collect_fresh", local_deferred_collect_fresh),
     check(
+        Core,
+        "request.fail_closed_refuses",
+        &["core.request.fail-closed"],
+        fail_closed_refuses,
+    ),
+    check(
+        Core,
+        "request.refusal_keeps_earlier_effects",
+        &["core.request.no-rollback"],
+        refusal_keeps_earlier_effects,
+    ),
+    check(
+        Core,
+        "remove.unlisten_and_forget",
+        &["core.remove.no-run-after"],
+        unlisten_and_forget,
+    ),
+    check(
+        Core,
+        "local.ordered_and_queued",
+        &["core.local.bound", "core.local.queued"],
+        local_ordered_and_queued,
+    ),
+    check(
+        Core,
+        "local.error_boundary",
+        &["core.local.error-boundary"],
+        local_error_boundary,
+    ),
+    check(
+        Core,
+        "local.forget_from_any_thread",
+        &["core.remove.no-run-after"],
+        local_forget_from_any_thread,
+    ),
+    check(
+        Core,
+        "local.deferred_collect_fresh",
+        &["core.local.queued"],
+        local_deferred_collect_fresh,
+    ),
+    check(
+        Core,
         "local.refused_request_queues_nothing",
+        &["core.request.veto-stops"],
         local_refused_request_queues_nothing,
     ),
-    check("deadline.inline_late_fails", deadline_inline_late_fails),
-    check("deadline.threaded_abandoned", deadline_threaded_abandoned),
     check(
+        Core,
+        "local.queued_emits_run_in_order",
+        &["core.local.queued"],
+        local_queued_emits_run_in_order,
+    ),
+    check(
+        Core,
+        "local.panicking_waker_ignored",
+        &["core.local.queued"],
+        local_panicking_waker_ignored,
+    ),
+    check(
+        Core,
+        "deadline.inline_late_fails",
+        &["core.deadline.inline-late"],
+        deadline_inline_late_fails,
+    ),
+    check(
+        Core,
+        "deadline.threaded_abandoned",
+        &["core.deadline.threaded-abandoned"],
+        deadline_threaded_abandoned,
+    ),
+    check(
+        Core,
         "introspect.points_listeners_counters",
+        &["core.introspect.points"],
         introspect_points_listeners_counters,
     ),
-    needs(
+    // defer
+    check(
+        Deferred,
         "defer.drain_in_ask_order",
-        &[Capability::Defer],
+        &[
+            "defer.ask.returns-at-once",
+            "defer.drain.ask-order",
+            "defer.drain.outcome-reported",
+            "defer.drain.later-asks-wait",
+        ],
         defer_drain_in_ask_order,
     ),
-    needs(
+    check(
+        Deferred,
         "defer.asks_per_thread",
-        &[Capability::Defer],
+        &["defer.thread.per-thread"],
         defer_asks_per_thread,
     ),
-    needs(
+    check(
+        Deferred,
+        "defer.ask_wakes_its_thread",
+        &["defer.ask.returns-at-once"],
+        defer_ask_wakes_its_thread,
+    ),
+    check(
+        Deferred,
+        "defer.listeners_read_at_the_drain",
+        &["defer.drain.ask-order"],
+        defer_listeners_read_at_the_drain,
+    ),
+    // timings
+    check(
+        Timed,
         "timings.timed_until_reset",
-        &[Capability::Timings],
+        &["timings.runs.timed", "timings.stats.exact-counts"],
         timings_timed_until_reset,
     ),
-    needs(
+    check(
+        Timed,
         "timings.over_budget_reported",
-        &[Capability::Timings],
+        &["timings.budget.reported-not-failed"],
         timings_over_budget_reported,
     ),
-    needs(
+    check(
+        Timed,
+        "timings.threaded_late_counts_the_wait",
+        &["timings.runs.timed"],
+        timings_threaded_late_counts_the_wait,
+    ),
+    // journal
+    check(
+        Journaled,
         "journal.refuses_off_journaled",
-        &[Capability::Journal],
+        &[
+            "journal.publish.journaled-only",
+            "core.kind.not-declarative",
+        ],
         journal_refuses_off_journaled,
     ),
-    needs(
+    check(
+        Journaled,
         "journal.delivered_in_order_off_publisher",
-        &[Capability::Journal],
+        &[
+            "journal.seq.ordered",
+            "journal.publish.never-waits",
+            "journal.delivery.once-in-order",
+            "journal.read.since",
+        ],
         journal_delivered,
     ),
-    needs(
+    check(
+        Journaled,
+        "journal.numbers_grow_by_one",
+        &["journal.seq.ordered"],
+        journal_numbers_grow_by_one,
+    ),
+    check(
+        Journaled,
+        "journal.since_reports_the_gap",
+        &["journal.read.since"],
+        journal_since_reports_the_gap,
+    ),
+    check(
+        Journaled,
+        "journal.wait_and_wait_for",
+        &["journal.read.wait-flush"],
+        journal_wait_and_wait_for,
+    ),
+    check(
+        Journaled,
+        "journal.cause_kept",
+        &["journal.read.wait-flush"],
+        journal_cause_kept,
+    ),
+    // crossing
+    check(
+        Crossing,
         "relay.resume_and_ingest",
-        &[Capability::Journal, Capability::Relay],
+        &[
+            "crossing.resume.cursor-order",
+            "crossing.ingest.delivered",
+            "crossing.origin.from-link",
+        ],
         relay_resume_and_ingest,
     ),
-    crossing(
+    Check {
+        // Run on every bus: one that offers `Relay` without `Journal`
+        // would skip the others.
+        needs: &[],
+        ..check(
+            Crossing,
+            "crossing.relay_implies_journal",
+            &["crossing.relay.implies-journal"],
+            crossing_relay_implies_journal,
+        )
+    },
+    check(
+        Crossing,
         "crossing.declared_requests_fail_closed_alter_never",
+        &[
+            "crossing.declare.what-crosses",
+            "core.declare.table-checked",
+            "core.request.fail-closed",
+            "core.kind.not-declarative",
+        ],
         crossing_declared,
     ),
-    crossing(
+    check(
+        Crossing,
         "crossing.answered_far_means_the_same",
+        &["crossing.answer.same-meaning"],
         crossing_answered_far_means_the_same,
     ),
-    crossing("crossing.veto_carries_its_reason", crossing_veto_reason),
-    crossing("crossing.no_answer_in_time_refuses", crossing_no_answer),
-    crossing(
+    check(
+        Crossing,
+        "crossing.veto_carries_its_reason",
+        &["crossing.answer.veto-reason"],
+        crossing_veto_reason,
+    ),
+    check(
+        Crossing,
+        "crossing.no_answer_in_time_refuses",
+        &["crossing.deadline.fail-closed"],
+        crossing_no_answer,
+    ),
+    check(
+        Crossing,
         "crossing.far_side_keeps_the_deadline",
+        &["crossing.deadline.far-side-keeps"],
         crossing_far_deadline,
     ),
-    crossing("crossing.answered_once_per_origin", crossing_answered_once),
-    crossing(
+    check(
+        Crossing,
+        "crossing.answered_once_per_origin",
+        &["crossing.ask.once-per-origin"],
+        crossing_answered_once,
+    ),
+    check(
+        Crossing,
         "crossing.not_a_relayable_request_refused",
+        &["crossing.answer.refuses-unknown"],
         crossing_not_relayable_refused,
     ),
-    crossing("crossing.origin_kept_on_entries", crossing_origin_kept),
-    crossing(
+    check(
+        Crossing,
+        "crossing.origin_kept_on_entries",
+        &["crossing.origin.from-link"],
+        crossing_origin_kept,
+    ),
+    check(
+        Crossing,
         "crossing.authority_checks_asks_first",
+        &["crossing.authority.first"],
         crossing_authority_asks,
     ),
-    crossing(
+    check(
+        Crossing,
         "crossing.authority_checks_events_panic_refuses",
+        &["crossing.authority.first"],
         crossing_authority_events,
     ),
-    crossing("crossing.same_version_only", crossing_same_version),
+    check(
+        Crossing,
+        "crossing.same_version_only",
+        &[
+            "crossing.version.same-only",
+            "crossing.ingest.delivered",
+            "crossing.answer.refuses-unknown",
+        ],
+        crossing_same_version,
+    ),
+    check(
+        Crossing,
+        "crossing.lost_entries_reported",
+        &["crossing.resume.lost-reported"],
+        crossing_lost_entries_reported,
+    ),
+    check(
+        Crossing,
+        "crossing.ingested_not_echoed",
+        &["crossing.ingest.no-echo"],
+        crossing_ingested_not_echoed,
+    ),
 ];
-
-const fn crossing(name: &'static str, body: fn(Make)) -> Check {
-    needs(name, &[Capability::Journal, Capability::Relay], body)
-}
 
 // --- Points ---
 
@@ -1725,4 +2117,434 @@ fn crossing_same_version(make: Make) {
     let read = relay.resume(from, 10);
     assert_eq!(read.entries.len(), 1);
     assert_eq!(read.entries[0].version, 2);
+}
+
+// --- Core: checks for the guarantees page's open rows ---
+
+/// A listener that listens and unlistens on the point it is run by.
+/// Whether the change shows in that same emit is not specified; it must
+/// not block, and the next emit sees it.
+fn listen_on_the_emitting_point(make: Make) {
+    let bus = make();
+    push(&*bus, "doomed", ListenOpts::new());
+    let inner = Arc::downgrade(&bus);
+    bus.listen::<Trail>(
+        "changer",
+        ListenOpts::new().before("doomed"),
+        move |_, v| {
+            let bus = inner.upgrade().expect("the bus is alive");
+            let known = bus.listeners(Trail::ID).unwrap_or_default();
+            if !known.iter().any(|l| l.id == "late") {
+                bus.listen::<Trail>("late", ListenOpts::new(), |_, v| {
+                    v.push("late".into());
+                    Ok(())
+                })
+                .map_err(|e| HookError::from(e.to_string()))?;
+            }
+            bus.unlisten(Trail::ID, "doomed");
+            v.push("changer".into());
+            Ok(())
+        },
+    )
+    .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let emitter = bus.clone();
+    thread::spawn(move || {
+        let _ = tx.send(emitter.alter::<Trail>((), Vec::new()));
+    });
+    let out = match rx.recv_timeout(WAIT) {
+        Ok(out) => out,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("listening on the emitting point blocked the emit for {WAIT:?}")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the emit panicked"),
+    };
+    assert!(out.failures.is_empty(), "{:?}", out.failures);
+    assert_eq!(out.value.first().map(String::as_str), Some("changer"));
+    let out = bus.alter::<Trail>((), Vec::new());
+    assert_eq!(
+        out.value,
+        ["changer", "late"],
+        "the next emit runs the listener added and not the one removed"
+    );
+}
+
+fn refusal_keeps_earlier_effects(make: Make) {
+    for fail_closed in [false, true] {
+        let bus = make();
+        if fail_closed {
+            bus.declare::<Run>(PointSpec::new("runs").fail_closed())
+                .unwrap();
+        }
+        let effects = Arc::new(Mutex::new(0));
+        let e = effects.clone();
+        bus.listen::<Run>("first", ListenOpts::new(), move |_, did| {
+            *e.lock().unwrap() += 1;
+            did.push("first".into());
+            Ok(())
+        })
+        .unwrap();
+        bus.listen::<Run>("stop", ListenOpts::new().after("first"), move |_, did| {
+            did.push("stop".into());
+            if fail_closed {
+                Err("broken".into())
+            } else {
+                Err(HookError::refuse("no"))
+            }
+        })
+        .unwrap();
+        bus.listen::<Run>("never", ListenOpts::new().after("stop"), |_, did| {
+            did.push("never".into());
+            Ok(())
+        })
+        .unwrap();
+        let out = bus.alter::<Run>("x".into(), vec![]);
+        let refusal = out.refused.expect("refused");
+        assert_eq!(refusal.failed, fail_closed);
+        assert_eq!(
+            out.value,
+            ["first"],
+            "the value as the listeners before the stop left it"
+        );
+        assert_eq!(*effects.lock().unwrap(), 1, "their effects stay");
+    }
+}
+
+fn local_queued_emits_run_in_order(make: Make) {
+    let bus = make();
+    let heard: Rc<RefCell<Vec<String>>> = Rc::default();
+    let h = heard.clone();
+    bus.listen_local::<Parts>("ui.parts", ListenOpts::new(), move |n, _| {
+        h.borrow_mut().push(format!("parts {n}"));
+        Ok(())
+    })
+    .unwrap();
+    let h = heard.clone();
+    bus.listen_local::<Trail>("ui.trail", ListenOpts::new(), move |_, _| {
+        h.borrow_mut().push("trail".into());
+        Ok(())
+    })
+    .unwrap();
+    let other = bus.clone();
+    thread::spawn(move || {
+        other.collect::<Parts>(1);
+        other.alter::<Trail>((), Vec::new());
+        other.collect::<Parts>(2);
+    })
+    .join()
+    .unwrap();
+    assert!(heard.borrow().is_empty(), "queued, not run");
+    assert_eq!(bus.run_pending().len(), 3);
+    assert_eq!(
+        *heard.borrow(),
+        ["parts 1", "trail", "parts 2"],
+        "emits run in the order they were queued"
+    );
+}
+
+fn local_panicking_waker_ignored(make: Make) {
+    let bus = make();
+    bus.on_pending(|_| panic!("a broken waker"));
+    let woken = Arc::new(Mutex::new(Vec::new()));
+    let w = woken.clone();
+    bus.on_pending(move |t| w.lock().unwrap().push(t));
+    bus.listen_local::<Trail>("ui", ListenOpts::new(), |_, v| {
+        v.push("ui".into());
+        Ok(())
+    })
+    .unwrap();
+    push(&*bus, "core", ListenOpts::new());
+    let other = bus.clone();
+    let out = thread::spawn(move || other.alter::<Trail>((), Vec::new()))
+        .join()
+        .expect("a panicking waker does not reach the emitter");
+    assert_eq!(out.value, ["core"]);
+    assert_eq!(out.deferred, ["ui"]);
+    assert_eq!(
+        *woken.lock().unwrap(),
+        [thread::current().id()],
+        "the other wakers are called"
+    );
+    let ran = bus.run_pending();
+    assert_eq!(ran.len(), 1);
+    assert_eq!(ran[0].ran, ["ui"]);
+}
+
+// --- Defer: checks for the guarantees page's open rows ---
+
+fn run_listener(bus: &dyn Bus, id: &'static str) {
+    bus.listen::<Run>(id, ListenOpts::new(), move |_, did| {
+        did.push(id.into());
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn defer_ask_wakes_its_thread(make: Make) {
+    let bus = make();
+    run_listener(&*bus, "persist");
+    bus.on_pending(|_| panic!("a broken waker"));
+    let woken: Arc<Mutex<Vec<ThreadId>>> = Arc::default();
+    let w = woken.clone();
+    bus.on_pending(move |t| w.lock().unwrap().push(t));
+    let other = bus.clone();
+    let (asker, drained) = thread::spawn(move || {
+        let defer = other.defer().expect("defer");
+        defer.ask::<Run>("x".into(), vec![]);
+        (thread::current().id(), defer.drain())
+    })
+    .join()
+    .expect("a panicking waker does not reach the asker");
+    assert_eq!(
+        *woken.lock().unwrap(),
+        [asker],
+        "an ask calls the wakers with its thread's id"
+    );
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].ran, ["persist"]);
+}
+
+fn defer_listeners_read_at_the_drain(make: Make) {
+    let bus = make();
+    run_listener(&*bus, "gone");
+    run_listener(&*bus, "kept");
+    let defer = bus.defer().expect("defer");
+    defer.ask::<Run>("x".into(), vec![]);
+    assert!(bus.unlisten(Run::ID, "gone"));
+    run_listener(&*bus, "added");
+    let ran = defer.drain();
+    assert_eq!(ran.len(), 1);
+    assert_eq!(
+        ran[0].ran,
+        ["kept", "added"],
+        "a listener removed after the ask does not run, one added does"
+    );
+}
+
+// --- Timings: checks for the guarantees page's open rows ---
+
+fn timings_threaded_late_counts_the_wait(make: Make) {
+    let bus = make();
+    let timings = bus.timings().expect("timings");
+    let deadline = MS * 30;
+    bus.listen::<Parts>(
+        "stuck",
+        ListenOpts::new().threaded().deadline(deadline),
+        |_, _| {
+            thread::sleep(Duration::from_secs(2));
+            Ok(())
+        },
+    )
+    .unwrap();
+    let out = bus.collect::<Parts>(1);
+    assert!(matches!(
+        out.failures[0].kind,
+        FailureKind::Late { took: None, .. }
+    ));
+    let t = timings.point(Parts::ID).expect("timed");
+    assert_eq!(t.passes.count, 1);
+    let stuck = t
+        .listeners
+        .iter()
+        .find(|l| l.id == "stuck")
+        .expect("a listener that missed its deadline is timed");
+    assert_eq!(stuck.stats.count, 1, "timed when the emit stopped waiting");
+    assert!(
+        stuck.stats.total >= deadline,
+        "it counts the time the emit waited: {:?}",
+        stuck.stats.total
+    );
+}
+
+// --- Journal: checks for the guarantees page's open rows ---
+
+/// How many entries a check publishes at most to push an entry out of a
+/// journal's window. A journal that keeps more is not pushed that far:
+/// the check's gap part passes without being exercised on it.
+pub const WINDOW_PROBE: u32 = 1 << 14;
+
+/// Calls `publish` until the entry `seq` has left the window,
+/// up to [`WINDOW_PROBE`]; whether it left.
+fn push_out(journal: &dyn bus_contract::Journal, seq: u64, publish: impl Fn(u32)) -> bool {
+    let kept = || journal.since(seq - 1, 1).entries.first().map(|e| e.seq) == Some(seq);
+    let mut n = 0;
+    while kept() {
+        if n == WINDOW_PROBE {
+            return false;
+        }
+        publish(n);
+        n += 1;
+    }
+    true
+}
+
+fn journal_numbers_grow_by_one(make: Make) {
+    let bus = make();
+    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    let journal = bus.journal().expect("journal");
+    let before = journal.last_seq();
+    let seqs: Vec<u64> = (0..5)
+        .map(|n| journal.publish::<Step>(n).expect("journaled"))
+        .collect();
+    let expected: Vec<u64> = (before + 1..=before + 5).collect();
+    assert_eq!(seqs, expected, "from 1, by one");
+    assert_eq!(journal.last_seq(), before + 5);
+}
+
+fn journal_since_reports_the_gap(make: Make) {
+    let bus = make();
+    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    let journal = bus.journal().expect("journal");
+    let first = journal.publish::<Step>(0).expect("journaled");
+    let read = journal.since(first - 1, 10);
+    assert!(!read.gap, "nothing dropped yet");
+    assert_eq!(read.entries.first().map(|e| e.seq), Some(first));
+    assert_eq!(read.last_seq, first);
+    let pushed = push_out(journal, first, |n| {
+        journal.publish::<Step>(n).expect("journaled");
+    });
+    if !pushed {
+        return;
+    }
+    let read = journal.since(first - 1, 10);
+    assert!(read.gap, "entries after {} left the window", first - 1);
+    assert!(read.entries.first().is_some_and(|e| e.seq > first));
+    let last = journal.last_seq();
+    let read = journal.since(last - 1, 10);
+    assert!(!read.gap, "a read inside the window has no gap");
+    assert_eq!(read.entries.len(), 1);
+}
+
+fn journal_wait_and_wait_for(make: Make) {
+    let bus = make();
+    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    let journal = bus.journal().expect("journal");
+    let before = journal.last_seq();
+    let seq = journal.publish::<Step>(7).expect("journaled");
+    let start = Instant::now();
+    let got = journal.wait(&[Step::ID], before, WAIT).expect("there");
+    assert!(
+        start.elapsed() < WAIT / 2,
+        "an entry already there is returned at once"
+    );
+    assert_eq!(got.seq, seq);
+    assert_eq!(got.read::<Step>(), Some(&7));
+    assert_eq!(
+        journal.wait(&[], before, WAIT).map(|e| e.seq),
+        Some(seq),
+        "no pattern matches every kind"
+    );
+    let start = Instant::now();
+    assert!(
+        journal
+            .wait(&["conformance.nothing"], before, MS * 50)
+            .is_none()
+    );
+    assert!(start.elapsed() >= MS * 50, "it waits up to the timeout");
+    let later = bus.clone();
+    let publisher = thread::spawn(move || {
+        thread::sleep(MS * 50);
+        later.journal().unwrap().publish::<Step>(8).unwrap()
+    });
+    let got = journal.wait_for::<Step>(seq, WAIT);
+    let published = publisher.join().unwrap();
+    assert_eq!(got, Some((published, 8)), "an entry to come is waited for");
+}
+
+fn journal_cause_kept(make: Make) {
+    let bus = make();
+    assert!(declare_all(&*bus, JOURNALED).is_empty());
+    let journal = bus.journal().expect("journal");
+    let cause = journal.publish::<Step>(1).expect("journaled");
+    let caused = journal.publish_caused::<Step>(2, cause).expect("journaled");
+    let read = journal.since(cause - 1, 10);
+    let found = |seq| {
+        read.entries
+            .iter()
+            .find(|e| e.seq == seq)
+            .map(|e| e.cause)
+            .expect("kept")
+    };
+    assert_eq!(found(cause), None);
+    assert_eq!(found(caused), Some(cause), "the cause is kept");
+}
+
+// --- Crossing: checks for the guarantees page's open rows ---
+
+fn crossing_relay_implies_journal(make: Make) {
+    let bus = make();
+    if bus.relay().is_some() {
+        assert!(bus.journal().is_some(), "a bus with Relay offers Journal");
+        assert!(offers(&*bus, Capability::Relay));
+    }
+}
+
+fn texts(read: &bus_contract::Resumed) -> Vec<&str> {
+    read.entries.iter().map(|e| e.text.as_str()).collect()
+}
+
+fn crossing_lost_entries_reported(make: Make) {
+    let bus = crossing_bus(make, 1);
+    let journal = bus.journal().expect("journal");
+    let relay = bus.relay().expect("relay");
+    let first = journal.publish::<Shared>(1).expect("journaled");
+    journal.publish::<Shared>(2).expect("journaled");
+    let all = relay.resume(Cursor::START, 10);
+    assert_eq!(all.lost, None, "the start loses nothing");
+    assert_eq!(texts(&all), ["1", "2"]);
+
+    let here = relay.cursor();
+    let other = Cursor {
+        run: if here.run == u64::MAX {
+            1
+        } else {
+            here.run + 1
+        },
+        seq: 1,
+    };
+    let read = relay.resume(other, 10);
+    assert_eq!(read.lost, Some(Lost::Restarted), "a cursor of another run");
+    assert_eq!(texts(&read), ["1", "2"], "the run's entries from its start");
+    assert_eq!(read.next.run, here.run);
+
+    let after_first = Cursor {
+        run: here.run,
+        seq: first,
+    };
+    assert_eq!(relay.resume(after_first, 10).lost, None, "nothing left yet");
+    let pushed = push_out(journal, first + 1, |n| {
+        journal.publish::<Shared>(n).expect("journaled");
+    });
+    if !pushed {
+        return;
+    }
+    let read = relay.resume(after_first, 1);
+    assert_eq!(
+        read.lost,
+        Some(Lost::Gap),
+        "the next entries left the window"
+    );
+    assert!(read.entries.first().is_some_and(|e| e.seq > first + 1));
+}
+
+fn crossing_ingested_not_echoed(make: Make) {
+    let bus = crossing_bus(make, 1);
+    let journal = bus.journal().expect("journal");
+    let relay = bus.relay().expect("relay");
+    let from = relay.cursor();
+    let peer = Origin::process("peer");
+    relay
+        .ingest(&peer, RelayedEntry::new(1, Shared::ID, "5"))
+        .expect("ingested");
+    relay
+        .ingest(&peer, RelayedEntry::new(2, "elsewhere.happened", "x"))
+        .expect("kept");
+    journal.publish::<Shared>(6).expect("journaled");
+    assert!(journal.flush(WAIT));
+    assert_eq!(
+        texts(&relay.resume(from, 10)),
+        ["6"],
+        "entries taken in are not served again"
+    );
+    assert_eq!(texts(&relay.resume(Cursor::START, 10)), ["6"]);
 }

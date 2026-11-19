@@ -1,0 +1,35 @@
+[package]
+name = "bus-kernel"
+version = "0.1.0"
+description = "A hook bus kernel implementing bus-contract: typed hook points, listeners with ids ordered by after/before and priority, alter and collect emits, a per-listener error boundary with panics caught and deadlines, local listeners, deferred requests, timings, a host journal and relay; and a conformance suite any bus-contract implementation can run"
+readme = "README.md"
+keywords = ["hooks", "event-bus", "plugins", "listeners", "bus-contract"]
+categories = ["rust-patterns", "concurrency"]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quazardous/bus-kernel"
+homepage = "https://github.com/quazardous/bus-kernel"
+documentation = "https://docs.rs/bus-kernel"
+authors = ["The bus-kernel contributors"]
+
+[features]
+# `bus_kernel::conformance`: the checks any `bus_contract::Bus`
+# implementation can run against itself (as a dev-dependency).
+conformance = []
+
+[dependencies]
+bus-contract = "0.3.3"
+# MIT OR Apache-2.0: the listener deadlines' clock on the web too, where
+# `std::time::Instant::now` panics.
+web-time = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

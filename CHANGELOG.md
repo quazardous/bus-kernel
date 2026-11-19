@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- Conformance: `crossing.declared_requests_fail_closed_alter_never`
+  looks only at the points it declares or tries to declare. It
+  expected no point at all to be declared on the bus, so it failed on
+  an application's bus that holds its own points. No other check
+  counts the bus's points as a whole; a new test runs the whole suite
+  on a bus with application points declared and listened to before
+  it runs.
+
 ## 0.3.0
 
 Implements bus-contract 0.5 and its capability contracts at 0.2

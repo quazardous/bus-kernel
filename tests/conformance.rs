@@ -163,3 +163,80 @@ fn the_extension_traits_and_the_lookup_agree() {
     assert_eq!(check.run(bare), Outcome::Passed);
     assert_eq!(check.run(hosted), Outcome::Passed);
 }
+
+/// An application's own points, declared on its bus before the suite
+/// runs: an event, a journaled and relayable event, a request and an
+/// alter.
+mod app {
+    use bus_kernel::bus_contract::{Point, PointId, PointKind};
+
+    pub struct Opened;
+    impl Point for Opened {
+        const ID: PointId = PointId::new("app.opened");
+        const KIND: PointKind = PointKind::Event;
+        type Input = String;
+        type Value = ();
+    }
+
+    pub struct Synced;
+    impl Point for Synced {
+        const ID: PointId = PointId::new("app.synced");
+        const KIND: PointKind = PointKind::Event;
+        type Input = u32;
+        type Value = ();
+    }
+
+    impl bus_kernel::bus_contract_crossing::Relayed for Synced {
+        fn encode(input: &u32) -> String {
+            input.to_string()
+        }
+        fn decode(text: &str) -> Result<u32, String> {
+            text.parse().map_err(|e| format!("{e}"))
+        }
+    }
+
+    pub struct Close;
+    impl Point for Close {
+        const ID: PointId = PointId::new("app.close");
+        const KIND: PointKind = PointKind::Request;
+        type Input = String;
+        type Value = Vec<String>;
+    }
+
+    pub struct Title;
+    impl Point for Title {
+        const ID: PointId = PointId::new("app.title");
+        const KIND: PointKind = PointKind::Alter;
+        type Input = ();
+        type Value = String;
+    }
+}
+
+const SYNCED_CODEC: bus_kernel::bus_contract_crossing::Codec =
+    bus_kernel::bus_contract_crossing::Codec::of::<app::Synced>();
+const SYNCED_RELAYABLE: &[bus_kernel::bus_contract::Facet] =
+    &[bus_kernel::bus_contract_crossing::relayable(&SYNCED_CODEC)];
+
+fn application() -> Arc<dyn Bus> {
+    use bus_kernel::bus_contract::{ListenOpts, PointDecl, declare_all};
+    let bus = hosted();
+    let table = [
+        PointDecl::of::<app::Opened>("A document opened."),
+        PointDecl::of::<app::Synced>("Synced elsewhere.").facets(SYNCED_RELAYABLE),
+        PointDecl::of::<app::Close>("May a document close?").fail_closed(),
+        PointDecl::of::<app::Title>("The window title."),
+    ];
+    assert!(declare_all(&*bus, &table).is_empty());
+    bus.listen::<app::Opened>("app.log", ListenOpts::new(), |_, _| Ok(()))
+        .unwrap();
+    bus
+}
+
+/// The verdicts do not depend on the application's other points.
+#[test]
+fn the_suite_passes_on_a_bus_holding_application_points() {
+    for (name, outcome) in conformance::report(application) {
+        assert_eq!(outcome, Outcome::Passed, "{name}");
+    }
+    conformance::run(application);
+}

@@ -29,7 +29,10 @@
 //! ```
 //!
 //! Each check builds the buses it needs with `make`, fresh ones, so a
-//! check never sees another's points. A check needing a capability the
+//! check never sees another's points. `make` may return a bus that
+//! already holds the application's own points: a check looks only at
+//! the points it declares itself (ids under `conformance.`), so its
+//! verdict does not depend on them. A check needing a capability the
 //! bus does not offer ([`Need`]) is skipped, not failed. Times are
 //! checked as lower bounds or with wide margins: a loaded machine makes
 //! runs longer, never shorter.
@@ -2017,7 +2020,15 @@ fn crossing_declared(make: Make) {
         ),
         "a request with no value codec cannot cross: {refused:?}"
     );
-    assert!(bus.points().iter().all(|p| !p.declared), "nothing declared");
+    // Only the points this check tried: the bus may hold the
+    // application's own points, declared before the suite runs.
+    assert!(
+        bus.points()
+            .iter()
+            .filter(|p| p.id == Title::ID.as_str() || p.id == Delete::ID.as_str())
+            .all(|p| !p.declared),
+        "neither refused point is declared"
+    );
     assert!(
         matches!(
             bus.declare::<Title>(PointSpec::new("A title.").facet(relayable(&TITLE_CODEC))),

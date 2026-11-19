@@ -447,6 +447,12 @@ const CHECKS: &[Check] = &[
         &["core.introspect.points"],
         introspect_points_listeners_counters,
     ),
+    check(
+        Core,
+        "capability.getter_and_lookup_agree",
+        &["core.capability.lookup-agrees"],
+        capability_getter_and_lookup_agree,
+    ),
     // defer
     check(
         Deferred,
@@ -1368,6 +1374,55 @@ fn deadline_threaded_abandoned(make: Make) {
 }
 
 // --- Introspection ---
+
+/// The address of the object a reference points at, to compare trait
+/// objects found by different routes.
+fn addr<T: ?Sized>(r: &T) -> *const () {
+    r as *const T as *const ()
+}
+
+/// Whether the getter and the typed lookup give the same answer.
+fn same<C: ?Sized>(getter: Option<&C>, lookup: Option<&C>) -> bool {
+    match (getter, lookup) {
+        (None, None) => true,
+        (Some(g), Some(l)) => addr(g) == addr(l),
+        _ => false,
+    }
+}
+
+fn capability_getter_and_lookup_agree(make: Make) {
+    use bus_contract::{Defer, Journal, Relay, Timings};
+    let bus = make();
+    assert!(
+        same(bus.defer(), bus.get::<dyn Defer>()),
+        "defer(): the getter and the lookup disagree"
+    );
+    assert!(
+        same(bus.timings(), bus.get::<dyn Timings>()),
+        "timings(): the getter and the lookup disagree"
+    );
+    assert!(
+        same(bus.journal(), bus.get::<dyn Journal>()),
+        "journal(): the getter and the lookup disagree"
+    );
+    assert!(
+        same(bus.relay(), bus.get::<dyn Relay>()),
+        "relay(): the getter and the lookup disagree"
+    );
+    // `offers` answers from the getters: it sees what the lookup sees.
+    assert_eq!(
+        offers(&*bus, Capability::Defer),
+        bus.get::<dyn Defer>().is_some()
+    );
+    assert_eq!(
+        offers(&*bus, Capability::Timings),
+        bus.get::<dyn Timings>().is_some()
+    );
+    assert_eq!(
+        offers(&*bus, Capability::Journal),
+        bus.get::<dyn Journal>().is_some()
+    );
+}
 
 fn introspect_points_listeners_counters(make: Make) {
     let bus = make();

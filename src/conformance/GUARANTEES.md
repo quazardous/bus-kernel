@@ -6,13 +6,16 @@ guarantee, and which conformance check proves each property.
 The contract is split into five parts. **core** is the `Bus` trait,
 which every implementation offers. The four others are optional
 capabilities, which a bus may or may not offer: **defer**, **timings**,
-**journal** and **crossing** (`Relay`, on top of the journal).
+**journal** and **crossing** (`Relay`, on top of the journal). A bus
+offers a capability through its getter (`Bus::journal`, …) and through
+the typed lookup (`Bus::capability`, `bus.get::<dyn Journal>()`), and
+the two agree (`core.capability.lookup-agrees`).
 
 Each property has a **stable id**, `<contract>.<area>.<property>`. Ids
 are never reused for another meaning: a property that changes meaning
 gets a new id, and a property that is dropped keeps its id retired. The
 "Checked by" column names the check of the conformance suite of
-[`bus-kernel`](https://github.com/quazardous/bus-kernel) (0.2.1) that
+[`bus-kernel`](https://github.com/quazardous/bus-kernel) (0.2.2) that
 proves the property on any implementation, or says "not covered yet".
 "Partly" means the check covers part of the property, and the rest is
 named.
@@ -99,6 +102,7 @@ introspection.
 | `core.local.error-boundary` | A deferred local listener that fails or panics is isolated as any other: its failure is reported by `run_pending`, and the others run. | | `local.error_boundary` |
 | `core.remove.no-run-after` | A listener removed by `unlisten` or `forget`, from any thread, never runs again, queued or not. `forget` removes every listener of an owner on every point. | | `remove.unlisten_and_forget`, `local.forget_from_any_thread` |
 | `core.introspect.points` | `points()` lists every point in id order with its listeners in run order; `listeners()` gives one point's. Each listener shows its owner, constraints, priority, effective deadline, threaded and local flags, missing targets, runs, failures and last failure. | Counters are not timings: durations belong to the timings capability. | `introspect.points_listeners_counters` |
+| `core.capability.lookup-agrees` | Each capability a bus offers (`Defer`, `Timings`, `Journal`, `Relay`) is reached through its getter (`defer()`, `timings()`, `journal()`, `relay()`) and through the lookup (`Bus::capability` with the `TypeId` of `dyn Defer`, …; typed: `capability::<dyn Defer, _>(bus)`, `bus.get::<dyn Defer>()`) with the same answer: both `None`, or both the same object. The getters default to the lookup, so a bus that implements only `capability` answers through both. A lookup answered with the cast of another capability gives `None`, never a wrong type. | A bus written before 0.4.4 that overrides the getters and not `capability` keeps working through the getters, `offers` and `declare_all`, but its lookup answers `None`, and the conformance check reports the mismatch until it implements `capability`. | `capability.getter_and_lookup_agree` |
 
 ## defer
 

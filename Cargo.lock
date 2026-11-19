@@ -10,13 +10,13 @@ checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "bus-contract"
-version = "0.4.0"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1387ca97bbb150323fa40bf136a2e78d65ec071965c31ed59d1577d9e1a90787"
+checksum = "9ac9d2a611582f1a3fb82d8e9ccfba9e3cad402332f52523fc441fec1a78fc7d"
 
 [[package]]
 name = "bus-kernel"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bus-contract",
  "web-time",
